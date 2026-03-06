@@ -103,27 +103,29 @@ class RiotClient:
             return data
         return None
     
+    def get_summoner_by_puuid(self, puuid: str) -> Optional[Dict[str, Any]]:
+        """
+        Get summoner data (including encrypted summoner_id) from puuid.
+        Returns: {id, accountId, puuid, profileIconId, revisionDate, summonerLevel}
+        """
+        endpoint = f"/lol/summoner/v4/summoners/by-puuid/{puuid}"
+        return self._make_request(endpoint, self.NA1_BASE_URL)
+
     def get_ranked_stats(self, summoner_id: str = None, puuid: str = None) -> Optional[Dict[str, Any]]:
         """
         Get current ranked stats for a summoner.
-        Can use either summoner_id (for backward compatibility) or puuid
         Returns list of ranked queues (SOLO/DUO, FLEX, etc)
         """
         if not summoner_id and not puuid:
             logger.error("get_ranked_stats requires either summoner_id or puuid")
             return None
-        
-        # If only summoner_id provided, we need to warn that this uses deprecated endpoint
-        if summoner_id and not puuid:
-            logger.warning("Using deprecated summoner_id for ranked stats, puuid preferred")
-            endpoint = f"/lol/league/v4/entries/by-summoner/{summoner_id}"
+
+        if puuid:
+            endpoint = f"/lol/league/v4/entries/by-puuid/{puuid}"
         else:
-            # Use puuid-based endpoint (newer)
-            endpoint = f"/lol/league/v4/entries/by-summoner/{summoner_id}" if summoner_id else None
-        
-        if endpoint:
-            return self._make_request(endpoint, self.NA1_BASE_URL)
-        return None
+            endpoint = f"/lol/league/v4/entries/by-summoner/{summoner_id}"
+
+        return self._make_request(endpoint, self.NA1_BASE_URL)
     
     def get_recent_matches(self, puuid: str, start: int = 0, count: int = 5) -> Optional[list]:
         """

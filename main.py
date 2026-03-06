@@ -94,20 +94,27 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1"):
         return
     
     try:
-        # Get summoner info
+        # Get summoner info (Account API returns puuid, gameName, tagLine)
         summoner = riot.get_summoner_by_name(summoner_name, tag)
         if not summoner:
             logger.warning(f"Could not find summoner: {summoner_name}")
             return
-        
-        summoner_id = summoner.get("id")
+
         puuid = summoner.get("puuid")
-        
+
+        # Get summoner_id via Summoner API
+        summoner_data = riot.get_summoner_by_puuid(puuid)
+        if not summoner_data:
+            logger.warning(f"Could not get summoner data for {summoner_name}")
+            return
+
+        summoner_id = summoner_data.get("id")
+
         # Add/update player in database
         db.add_or_update_player(summoner_id, puuid, summoner_name, tag)
-        
+
         # Get ranked stats
-        ranked_stats = riot.get_ranked_stats(summoner_id)
+        ranked_stats = riot.get_ranked_stats(puuid=puuid)
         if not ranked_stats:
             logger.warning(f"No ranked stats for {summoner_name}")
             return
