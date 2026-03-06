@@ -1,6 +1,6 @@
 import discord
 from typing import Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 
 class DiscordHandler:
     """
@@ -72,25 +72,31 @@ class DiscordHandler:
         duration = DiscordHandler.format_duration(match_data["game_duration"])
         win_streak = match_data.get("win_streak", 0)
         loss_streak = match_data.get("loss_streak", 0)
-        
+        game_end_ts = match_data.get("game_end_ts")
+
         # Parse player name and tag for op.gg link
         if "#" in player_name:
-            display_name, tag = player_name.split("#")
+            display_name, tag = player_name.split("#", 1)
             opgg_url = f"https://op.gg/lol/summoners/na/{display_name}-{tag}"
         else:
             display_name = player_name
             opgg_url = f"https://op.gg/lol/summoners/na/{player_name}"
-        
+
         # Title and color
         result_emoji = DiscordHandler.EMOJIS["win"] if win else DiscordHandler.EMOJIS["loss"]
         result_text = "VICTORY" if win else "DEFEAT"
         color = DiscordHandler.get_kda_color(kda, win)
-        
+
+        embed_ts = (
+            datetime.fromtimestamp(game_end_ts, tz=timezone.utc)
+            if game_end_ts else datetime.now(tz=timezone.utc)
+        )
+
         embed = discord.Embed(
             title=f"{result_emoji} {display_name} - {result_text}",
             description=f"[View on op.gg]({opgg_url})",
             color=color,
-            timestamp=datetime.utcnow()
+            timestamp=embed_ts
         )
         
         # KDA section
@@ -117,14 +123,15 @@ class DiscordHandler:
         )
         
         # LP change
-        lp_symbol = "+" if lp_change >= 0 else ""
-        lp_text = f"{lp_symbol}{lp_change} LP"
-        if lp_change < 0:
-            lp_text = f"{lp_change} LP"
-        
+        if lp_change is None:
+            lp_value = f"**{new_lp} LP**"
+        else:
+            prefix = "+" if lp_change >= 0 else ""
+            lp_value = f"{prefix}{lp_change} LP → **{new_lp} LP**"
+
         embed.add_field(
             name="LP",
-            value=f"{lp_text} → **{new_lp} LP**",
+            value=lp_value,
             inline=True
         )
         

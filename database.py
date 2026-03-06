@@ -78,11 +78,13 @@ class Database:
         """Add or update a player in the database."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
+            # Upsert on puuid (permanent Riot identifier) so stale rows with a
+            # NULL or rotated summoner_id get corrected automatically.
             cursor.execute("""
                 INSERT INTO players (summoner_id, puuid, summoner_name, tag, last_checked)
                 VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(summoner_id) DO UPDATE SET
-                    puuid = excluded.puuid,
+                ON CONFLICT(puuid) DO UPDATE SET
+                    summoner_id = excluded.summoner_id,
                     summoner_name = excluded.summoner_name,
                     tag = excluded.tag,
                     last_checked = CURRENT_TIMESTAMP
@@ -141,21 +143,35 @@ class Database:
             
             conn.commit()
     
-    def add_match(self, match_id: str, summoner_id: str, win: bool, champion: str, 
-                  kills: int, deaths: int, assists: int, lp_change: int, new_lp: int, 
+    def add_match(self, match_id: str, summoner_id: str, win: bool, champion: str,
+                  kills: int, deaths: int, assists: int, lp_change: int, new_lp: int,
                   game_duration: int):
-        """Record a match result."""
+        """Record a match result and stamp last_match_id on the player row."""
         kda = (kills + assists) / max(deaths, 1)
-        
+
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT OR IGNORE INTO matches 
-                (match_id, summoner_id, win, champion, kills, deaths, assists, kda, 
+                INSERT OR IGNORE INTO matches
+                (match_id, summoner_id, win, champion, kills, deaths, assists, kda,
                  lp_change, new_lp, game_duration)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (match_id, summoner_id, win, champion, kills, deaths, assists, kda, 
+            """, (match_id, summoner_id, win, champion, kills, deaths, assists, kda,
                   lp_change, new_lp, game_duration))
+            cursor.execute(
+                "UPDATE players SET last_match_id = ? WHERE summoner_id = ?",
+                (match_id, summoner_id)
+            )
+            conn.commit()
+
+    def update_last_match_id(self, summoner_id: str, match_id: str):
+        """Stamp last_match_id without recording full match stats (e.g. old matches on startup)."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE players SET last_match_id = ? WHERE summoner_id = ?",
+                (match_id, summoner_id)
+            )
             conn.commit()
     
     def get_last_match(self, summoner_id: str) -> dict:

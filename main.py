@@ -4,8 +4,9 @@ import os
 import json
 import logging
 import asyncio
+import time
+from datetime import datetime, timezone
 from dotenv import load_dotenv
-from datetime import datetime
 
 from riot_client import RiotClient
 from database import Database
@@ -101,14 +102,9 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1"):
             return
 
         puuid = summoner.get("puuid")
-
-        # Get summoner_id via Summoner API
-        summoner_data = riot.get_summoner_by_puuid(puuid)
-        if not summoner_data:
-            logger.warning(f"Could not get summoner data for {summoner_name}")
-            return
-
-        summoner_id = summoner_data.get("id")
+        # Riot removed 'id' from the Summoner API response — puuid is now the
+        # stable primary identifier used everywhere.
+        summoner_id = puuid
 
         # Add/update player in database
         db.add_or_update_player(summoner_id, puuid, summoner_name, tag)
@@ -130,25 +126,28 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1"):
             logger.warning(f"No solo queue ranked for {summoner_name}")
             return
         
+        # Snapshot LP before updating so we can compute the delta later
+        player_data = db.get_player(summoner_id)
+        old_lp = player_data.get("current_lp") if player_data else None
+
         # Update player rank in database
         tier = solo_queue.get("tier", "Unranked")
         rank = solo_queue.get("rank", "")
         lp = solo_queue.get("leaguePoints", 0)
         wins = solo_queue.get("wins", 0)
         losses = solo_queue.get("losses", 0)
-        
+
         db.update_player_rank(summoner_id, tier, rank, lp)
-        
+
         # Check for recent matches
         recent_matches = riot.get_recent_matches(puuid, start=0, count=1)
         if not recent_matches or len(recent_matches) == 0:
             logger.debug(f"No recent matches for {summoner_name}")
             return
-        
+
         latest_match_id = recent_matches[0]
-        
+
         # Check if this match is already recorded
-        player_data = db.get_player(summoner_id)
         if player_data and player_data.get("last_match_id") == latest_match_id:
             logger.debug(f"{summoner_name} - already processed {latest_match_id}")
             return
@@ -166,25 +165,40 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1"):
             return
         
         # Extract match stats
+        info = match_data.get("info", {})
         win = player_match.get("win", False)
         champion = player_match.get("championName", "Unknown")
         kills = player_match.get("kills", 0)
         deaths = player_match.get("deaths", 0)
         assists = player_match.get("assists", 0)
-        game_duration = match_data.get("info", {}).get("gameDuration", 0)
+        game_duration = info.get("gameDuration", 0)
+
+        # Game end time (ms → s). Fall back to creation + duration if absent.
+        game_end_ts_ms = info.get("gameEndTimestamp") or (
+            info.get("gameCreation", 0) + game_duration * 1000
+        )
+        game_end_ts = game_end_ts_ms / 1000
+
+        # On restart, skip matches older than 24 hours to avoid spam.
+        ONE_DAY = 86400
+        if time.time() - game_end_ts > ONE_DAY:
+            db.update_last_match_id(summoner_id, latest_match_id)
+            logger.info(f"{summoner_name} — tracking match history")
+            return
         
         # Calculate KDA
         kda = (kills + assists) / max(deaths, 1)
-        
-        # LP change (rough estimate - can be 0 or adjusted based on your preference)
-        lp_change = 0
+
+        # LP delta: new LP minus the LP we snapshotted before this check.
+        # None means we have no baseline (first ever check), so don't show a delta.
         new_lp = lp
+        lp_change = (lp - old_lp) if old_lp is not None else None
         
         # Update streak
         db.update_streaks(summoner_id, win)
         
         # Get updated player data with new streaks
-        updated_player = db.get_player(summoner_id)
+        updated_player = db.get_player(summoner_id) or {}
         win_streak = updated_player.get("win_streak", 0)
         loss_streak = updated_player.get("loss_streak", 0)
         
@@ -213,22 +227,17 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1"):
             "lp_change": lp_change,
             "new_lp": new_lp,
             "game_duration": game_duration,
+            "game_end_ts": game_end_ts,
             "win_streak": win_streak,
             "loss_streak": loss_streak,
         }
-        
-        embed = DiscordHandler.create_match_embed(summoner_name, match_info)
+
+        embed = DiscordHandler.create_match_embed(f"{summoner_name}#{tag}", match_info)
         
         # Send to Discord
         await channel.send(embed=embed)
         logger.info(f"Posted match result for {summoner_name}: {'WIN' if win else 'LOSS'}")
-        
-        # Update last processed match ID
-        with open("config.json", "r") as f:
-            config = json.load(f)
-        
-        # (Note: In production, you'd want to store this in the database instead)
-        
+
     except Exception as e:
         logger.error(f"Exception in check_player_matches: {e}", exc_info=True)
         await asyncio.sleep(1)
