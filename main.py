@@ -160,7 +160,7 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1"):
             return
         
         # Get player's performance in match
-        player_match = riot.get_player_in_match(match_data, summoner_id)
+        player_match = riot.get_player_in_match(match_data, puuid)
         if not player_match:
             logger.warning(f"Could not find {summoner_name} in match {latest_match_id}")
             return

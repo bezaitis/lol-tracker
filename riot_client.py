@@ -143,15 +143,15 @@ class RiotClient:
         endpoint = f"/lol/match/v5/matches/{match_id}"
         return self._make_request(endpoint, self.AMERICAS_BASE_URL)
     
-    def get_player_in_match(self, match_data: Dict[str, Any], summoner_id: str) -> Optional[Dict[str, Any]]:
+    def get_player_in_match(self, match_data: Dict[str, Any], puuid: str) -> Optional[Dict[str, Any]]:
         """
         Extract a specific player's stats from match data.
         """
         if not match_data or "info" not in match_data:
             return None
-        
+
         for participant in match_data["info"]["participants"]:
-            if participant.get("summonerId") == summoner_id:
+            if participant.get("puuid") == puuid:
                 return participant
-        
+
         return None
