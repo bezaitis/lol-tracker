@@ -1,0 +1,35 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to Oracle server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: 163.192.105.166
+          username: opc
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            APP_DIR=/opt/lol-tracker
+
+            if [ -d "$APP_DIR/.git" ]; then
+              cd $APP_DIR
+              git pull origin main
+            else
+              sudo git clone https://github.com/bezaitis/lol-tracker $APP_DIR
+              sudo chown -R opc:opc $APP_DIR
+              cd $APP_DIR
+            fi
+
+            if [ ! -d "$APP_DIR/venv" ]; then
+              python3.11 -m venv $APP_DIR/venv
+            fi
+
+            $APP_DIR/venv/bin/pip install -r $APP_DIR/requirements.txt
+            sudo systemctl restart lol-tracker
