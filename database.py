@@ -79,9 +79,13 @@ class Database:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT OR REPLACE INTO players 
-                (summoner_id, puuid, summoner_name, tag, last_checked)
+                INSERT INTO players (summoner_id, puuid, summoner_name, tag, last_checked)
                 VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(summoner_id) DO UPDATE SET
+                    puuid = excluded.puuid,
+                    summoner_name = excluded.summoner_name,
+                    tag = excluded.tag,
+                    last_checked = CURRENT_TIMESTAMP
             """, (summoner_id, puuid, summoner_name, tag))
             conn.commit()
     
