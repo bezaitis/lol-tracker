@@ -24,6 +24,7 @@ class DiscordHandler:
         "SILVER": "⚪",
         "GOLD": "🟨",
         "PLATINUM": "🟩",
+        "EMERALD": "💚",
         "DIAMOND": "🔷",
         "MASTER": "👑",
         "GRANDMASTER": "👑",
@@ -60,6 +61,12 @@ class DiscordHandler:
         """
         Create an embed for a match result.
         player_name format: "gameName#tagLine" or "gameName"
+
+        match_data optional keys:
+          promoted (bool)   – player promoted this match; show LP without misleading delta
+          demoted  (bool)   – player demoted this match
+          gold_diff (int)   – gold earned vs lane opponent (positive = ahead)
+          inting_emoji (str)– resolved guild emoji string for :inting:
         """
         win = match_data["win"]
         champion = match_data["champion"]
@@ -68,11 +75,16 @@ class DiscordHandler:
         assists = match_data["assists"]
         kda = match_data["kda"]
         lp_change = match_data["lp_change"]
-        new_lp = match_data["new_lp"]
+        new_lp = match_data.get("new_lp")  # None for backfill matches
         duration = DiscordHandler.format_duration(match_data["game_duration"])
         win_streak = match_data.get("win_streak", 0)
         loss_streak = match_data.get("loss_streak", 0)
         game_end_ts = match_data.get("game_end_ts")
+        promoted = match_data.get("promoted", False)
+        demoted = match_data.get("demoted", False)
+        gold_diff = match_data.get("gold_diff")
+        inting_emoji = match_data.get("inting_emoji", "💀")
+        pentakills = match_data.get("pentakills", 0)
 
         # Parse player name and tag for op.gg link
         if "#" in player_name:
@@ -98,7 +110,7 @@ class DiscordHandler:
             color=color,
             timestamp=embed_ts
         )
-        
+
         # KDA section
         kda_text = f"{kills}/{deaths}/{assists}"
         performance = "Excellent" if kda > 5 else "Good" if kda > 3 else "Okay" if kda > 1 else "Rough"
@@ -107,34 +119,51 @@ class DiscordHandler:
             value=f"**{kda_text}** ({kda:.2f} KDA) - {performance}",
             inline=False
         )
-        
+
         # Champion
         embed.add_field(
             name="Champion",
             value=champion,
             inline=True
         )
-        
+
         # Game duration
         embed.add_field(
             name="Duration",
             value=duration,
             inline=True
         )
-        
-        # LP change
-        if lp_change is None:
-            lp_value = f"**{new_lp} LP**"
-        else:
-            prefix = "+" if lp_change >= 0 else ""
-            lp_value = f"{prefix}{lp_change} LP → **{new_lp} LP**"
 
-        embed.add_field(
-            name="LP",
-            value=lp_value,
-            inline=True
-        )
-        
+        # LP — skip entirely for backfill matches (new_lp is None); handle rank change edge cases
+        if new_lp is None and not promoted and not demoted:
+            pass  # backfill match: API can't give per-game LP, so omit the field
+        else:
+            if promoted:
+                lp_value = f"🎉 Promoted! → **{new_lp} LP**"
+            elif demoted:
+                lp_value = f"📉 Demoted → **{new_lp} LP**"
+            elif lp_change is None:
+                lp_value = f"**{new_lp} LP**"
+            else:
+                prefix = "+" if lp_change >= 0 else ""
+                lp_value = f"{prefix}{lp_change} LP → **{new_lp} LP**"
+
+            embed.add_field(
+                name="LP",
+                value=lp_value,
+                inline=True
+            )
+
+        # Gold differential vs lane opponent
+        if gold_diff is not None:
+            gold_sign = "+" if gold_diff >= 0 else ""
+            gold_emoji = "🟡" if gold_diff >= 0 else "💸"
+            embed.add_field(
+                name="Gold Diff",
+                value=f"{gold_emoji} {gold_sign}{gold_diff:,}g",
+                inline=True
+            )
+
         # Streaks
         if win_streak > 1:
             streak_text = f"🔥 {win_streak} Win Streak"
@@ -152,12 +181,18 @@ class DiscordHandler:
                 value=streak_text,
                 inline=True
             )
-        
-        # Performance analysis
-        if deaths >= 5 and kills + assists < 5:
+
+        # Performance analysis — pentakill takes priority over everything else
+        if pentakills > 0:
+            embed.add_field(
+                name="🎆 PENTAKILL 🎆",
+                value=f"**{'🎆 ' * pentakills}PENTAKILL{'S' if pentakills > 1 else ''}!**",
+                inline=False
+            )
+        elif deaths >= 5 and kills + assists < 5:
             embed.add_field(
                 name="Analysis",
-                value=":inting: Looking a bit rough there chief",
+                value=f"{inting_emoji} Looking a bit rough there chief",
                 inline=False
             )
         elif kda > 5 and win:
@@ -166,20 +201,21 @@ class DiscordHandler:
                 value="🎯 Absolutely popped off!",
                 inline=False
             )
-        
+
         return embed
     
     @staticmethod
-    def create_rank_up_embed(player_name: str, old_rank: str, new_rank: str) -> discord.Embed:
+    def create_rank_up_embed(player_name: str, old_rank: str, new_rank: str, mention: str = None) -> discord.Embed:
         """Create an embed for rank promotion."""
-        tier = new_rank.split()[0]  # Get tier from "Gold IV" etc
+        tier = new_rank.split()[0].upper()  # Get tier from "Gold IV" etc, normalize to uppercase
         tier_emoji = DiscordHandler.RANK_EMOJIS.get(tier, "⭐")
-        
+
+        desc = f"{mention} **{player_name}** climbed!" if mention else f"**{player_name}** climbed!"
         embed = discord.Embed(
             title=f"🎉 RANK UP! 🎉",
-            description=f"**{player_name}** climbed!",
+            description=desc,
             color=0x00FF00,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(tz=timezone.utc)
         )
         
         embed.add_field(
@@ -191,16 +227,17 @@ class DiscordHandler:
         return embed
     
     @staticmethod
-    def create_rank_down_embed(player_name: str, old_rank: str, new_rank: str) -> discord.Embed:
+    def create_rank_down_embed(player_name: str, old_rank: str, new_rank: str, mention: str = None) -> discord.Embed:
         """Create an embed for rank demotion."""
-        tier = new_rank.split()[0]
+        tier = new_rank.split()[0].upper()  # Normalize to uppercase for RANK_EMOJIS lookup
         tier_emoji = DiscordHandler.RANK_EMOJIS.get(tier, "⭐")
-        
+
+        desc = f"{mention} **{player_name}** got demoted..." if mention else f"**{player_name}** got demoted..."
         embed = discord.Embed(
             title=f"📉 RANK DOWN",
-            description=f"**{player_name}** got demoted...",
+            description=desc,
             color=0xFF6347,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(tz=timezone.utc)
         )
         
         embed.add_field(

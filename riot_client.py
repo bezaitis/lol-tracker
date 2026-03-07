@@ -1,7 +1,6 @@
 import requests
 import time
 from typing import Optional, Dict, Any
-from functools import lru_cache
 from urllib.parse import quote
 import logging
 
@@ -127,12 +126,16 @@ class RiotClient:
 
         return self._make_request(endpoint, self.NA1_BASE_URL)
     
-    def get_recent_matches(self, puuid: str, start: int = 0, count: int = 5) -> Optional[list]:
+    def get_recent_matches(self, puuid: str, start: int = 0, count: int = 5, queue: int = 420) -> Optional[list]:
         """
         Get recent match IDs for a player.
+        queue=420 is Ranked Solo/Duo (default). Pass queue=None to fetch all queues.
         Returns list of match IDs
         """
-        endpoint = f"/lol/match/v5/matches/by-puuid/{puuid}/ids?start={start}&count={count}"
+        params = f"start={start}&count={count}"
+        if queue is not None:
+            params += f"&queue={queue}"
+        endpoint = f"/lol/match/v5/matches/by-puuid/{puuid}/ids?{params}"
         return self._make_request(endpoint, self.AMERICAS_BASE_URL)
     
     def get_match_details(self, match_id: str) -> Optional[Dict[str, Any]]:

@@ -2,35 +2,43 @@
   "players": [
     {
       "summoner_name": "bez",
-      "tag": "7979"
+      "tag": "7979",
+      "discord_id": "255523967677235201"
     },
     {
       "summoner_name": "CatsaultRifle",
-      "tag": "1255"
+      "tag": "1255",
+      "discord_id": "363786934981754881"
     },
     {
       "summoner_name": "Axstral",
-      "tag": "xaunt"
+      "tag": "xaunt",
+      "discord_id": "443140137946447872"
     },
     {
       "summoner_name": "BootyHoleBandit",
-      "tag": "QRQKG"
+      "tag": "QRQKG",
+      "discord_id": "560267615558434836"
     },
     {
       "summoner_name": "Thiccque",
-      "tag": "4964"
+      "tag": "4964",
+      "discord_id": "569169032662614026"
     },
     {
       "summoner_name": "Zero",
-      "tag": "Zer0"
+      "tag": "Zer0",
+      "discord_id": "305856566760833025"
     },
     {
       "summoner_name": "LiterallyAkałi",
-      "tag": "Best"
+      "tag": "Best",
+      "discord_id": "300006958965194752"
     },
     {
       "summoner_name": "HypergoatN",
-      "tag": "1987"
+      "tag": "1987",
+      "discord_id": "583454676637450260"
     }
   ]
 }
