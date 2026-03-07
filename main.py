@@ -1,7 +1,9 @@
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 import os
 import json
+import io
 import logging
 import asyncio
 import sqlite3
@@ -40,9 +42,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Bot setup
+# Bot setup — no prefix since we're using slash commands exclusively
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="\x00", intents=intents)  # null prefix = disabled
 
 # Clients
 riot = None
@@ -79,6 +81,13 @@ async def on_ready():
     else:
         logger.warning("Could not find :inting: emoji in guild — using 💀 fallback")
 
+    # Register slash commands
+    try:
+        synced = await bot.tree.sync()
+        logger.info(f"Synced {len(synced)} slash command(s)")
+    except Exception as e:
+        logger.error(f"Failed to sync slash commands: {e}")
+
     # Start the tracking loop
     if not check_matches.is_running():
         check_matches.start()
@@ -88,12 +97,11 @@ async def on_ready():
 async def check_matches():
     """Main loop - check all players every 60 seconds"""
     try:
-        # Load player list from config
         with open("config.json", "r") as f:
             config = json.load(f)
-        
+
         players = config.get("players", [])
-        
+
         for player_config in players:
             summoner_name = player_config.get("summoner_name")
             tag = player_config.get("tag", "NA1")
@@ -105,8 +113,8 @@ async def check_matches():
                 await check_player_matches(summoner_name, tag, player_config)
             except Exception as e:
                 logger.error(f"Error checking {summoner_name}: {e}")
-                await asyncio.sleep(1)  # Small delay between players
-    
+            await asyncio.sleep(1)
+
     except Exception as e:
         logger.error(f"Error in check_matches loop: {e}")
 
@@ -123,27 +131,20 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
     discord_id = player_config.get("discord_id")
 
     try:
-        # Get summoner info (Account API returns puuid, gameName, tagLine)
         summoner = riot.get_summoner_by_name(summoner_name, tag)
         if not summoner:
             logger.warning(f"Could not find summoner: {summoner_name}")
             return
 
         puuid = summoner.get("puuid")
-        # Riot removed 'id' from the Summoner API response — puuid is now the
-        # stable primary identifier used everywhere.
-        summoner_id = puuid
 
-        # Add/update player in database
-        db.add_or_update_player(summoner_id, puuid, summoner_name, tag)
+        db.add_or_update_player(puuid, summoner_name, tag)
 
-        # Get ranked stats
         ranked_stats = riot.get_ranked_stats(puuid=puuid)
         if not ranked_stats:
             logger.warning(f"No ranked stats for {summoner_name}")
             return
 
-        # Find SOLO_RANKED queue
         solo_queue = None
         for queue in ranked_stats:
             if queue.get("queueType") == "RANKED_SOLO_5x5":
@@ -154,18 +155,16 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
             logger.warning(f"No solo queue ranked for {summoner_name}")
             return
 
-        # Snapshot rank + LP before updating so we can compute deltas later
-        player_data = db.get_player(summoner_id)
+        player_data = db.get_player(puuid)
         old_lp = player_data.get("current_lp") if player_data else None
         old_tier = player_data.get("current_tier") if player_data else None
         old_rank = player_data.get("current_rank") if player_data else None
 
-        # Update player rank in database
         tier = solo_queue.get("tier", "Unranked")
         rank = solo_queue.get("rank", "")
         lp = solo_queue.get("leaguePoints", 0)
 
-        db.update_player_rank(summoner_id, tier, rank, lp)
+        db.update_player_rank(puuid, tier, rank, lp)
 
         # Detect rank changes and send a dedicated embed
         rank_promoted = False
@@ -176,7 +175,7 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
             if new_val != old_val:
                 old_rank_str = f"{old_tier.title()} {old_rank}"
                 new_rank_str = f"{tier.title()} {rank}"
-                db.record_rank_change(summoner_id, old_tier, tier, old_rank or "", rank)
+                db.record_rank_change(puuid, old_tier, tier, old_rank or "", rank)
                 mention_str = f"<@{discord_id}>" if discord_id else None
                 if new_val > old_val:
                     rank_promoted = True
@@ -192,7 +191,6 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
                     logger.info(f"{summoner_name} ranked DOWN: {old_rank_str} → {new_rank_str}")
                 await channel.send(embed=rank_embed)
 
-        # Fetch last 3 ranked matches to catch up on games missed while bot was down
         recent_matches = riot.get_recent_matches(puuid, start=0, count=3)
         if not recent_matches:
             logger.debug(f"No recent matches for {summoner_name}")
@@ -200,7 +198,6 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
 
         last_seen_id = player_data.get("last_match_id") if player_data else None
 
-        # Collect new match IDs (stop at the last processed one)
         new_match_ids = []
         for mid in recent_matches:
             if mid == last_seen_id:
@@ -222,13 +219,13 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
             match_data = riot.get_match_details(match_id)
             if not match_data:
                 logger.warning(f"Could not get match details for {match_id}")
-                db.update_last_match_id(summoner_id, match_id)
+                db.update_last_match_id(puuid, match_id)
                 continue
 
             player_match = riot.get_player_in_match(match_data, puuid)
             if not player_match:
                 logger.warning(f"Could not find {summoner_name} in match {match_id}")
-                db.update_last_match_id(summoner_id, match_id)
+                db.update_last_match_id(puuid, match_id)
                 continue
 
             info = match_data.get("info", {})
@@ -244,18 +241,14 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
             )
             game_end_ts = game_end_ts_ms / 1000
 
-            # Skip matches older than 24 hours — just mark as seen
             if time.time() - game_end_ts > ONE_DAY:
-                db.update_last_match_id(summoner_id, match_id)
+                db.update_last_match_id(puuid, match_id)
                 logger.info(f"{summoner_name} — skipping old match {match_id}")
                 continue
 
             kda = (kills + assists) / max(deaths, 1)
             pentakills = player_match.get("pentaKills", 0)
 
-            # LP delta only for the most recent match; older missed games can't be accurately computed.
-            # Also suppress delta if a rank change happened (LP reset to new division value).
-            # Also suppress on the very first run for a player (last_seen_id is None → no prior LP baseline).
             if is_latest and old_lp is not None and last_seen_id is not None and not rank_promoted and not rank_demoted:
                 lp_change = lp - old_lp
             else:
@@ -273,18 +266,26 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
                         gold_diff = player_gold - participant.get("goldEarned", 0)
                         break
 
-            # Update streak
-            db.update_streaks(summoner_id, win)
+            # CS/min and position
+            total_cs = player_match.get("totalMinionsKilled", 0) + player_match.get("neutralMinionsKilled", 0)
+            duration_min = game_duration / 60 if game_duration > 0 else 1
+            cs_per_min = round(total_cs / duration_min, 1)
 
-            # Get updated streaks
-            updated_player = db.get_player(summoner_id) or {}
+            position_map = {
+                "TOP": "Top", "JUNGLE": "Jungle", "MIDDLE": "Mid",
+                "BOTTOM": "Bot", "UTILITY": "Support"
+            }
+            position = position_map.get(player_match.get("teamPosition", ""), None)
+
+            db.update_streaks(puuid, win)
+
+            updated_player = db.get_player(puuid) or {}
             win_streak = updated_player.get("win_streak", 0)
             loss_streak = updated_player.get("loss_streak", 0)
 
-            # Record match in DB
             db.add_match(
                 match_id=match_id,
-                summoner_id=summoner_id,
+                puuid=puuid,
                 win=win,
                 champion=champion,
                 kills=kills,
@@ -304,7 +305,7 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
                 "assists": assists,
                 "kda": kda,
                 "lp_change": lp_change,
-                "new_lp": lp if is_latest else None,  # hide LP on backfill matches (API has no per-game LP)
+                "new_lp": lp if is_latest else None,
                 "game_duration": game_duration,
                 "game_end_ts": game_end_ts,
                 "win_streak": win_streak,
@@ -314,6 +315,8 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
                 "gold_diff": gold_diff,
                 "inting_emoji": inting_emoji_str,
                 "pentakills": pentakills,
+                "cs_per_min": cs_per_min,
+                "position": position,
             }
 
             embed = DiscordHandler.create_match_embed(f"{summoner_name}#{tag}", match_info)
@@ -329,48 +332,46 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
         logger.error(f"Exception in check_player_matches for {summoner_name}: {e}", exc_info=True)
         await asyncio.sleep(1)
 
-@bot.command()
-async def ping(ctx):
-    """Test command"""
-    await ctx.send(f"Pong! {bot.latency * 1000:.0f}ms")
 
-@bot.command()
-async def players(ctx):
-    """Show tracked players"""
+# ---------------------------------------------------------------------------
+# Slash commands
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="ping", description="Check bot latency")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message(f"Pong! {bot.latency * 1000:.0f}ms")
+
+
+@bot.tree.command(name="players", description="List all tracked players")
+async def players(interaction: discord.Interaction):
     with open("config.json", "r") as f:
         config = json.load(f)
 
-    players = config.get("players", [])
-    if not players:
-        await ctx.send("No players configured!")
+    player_list_cfg = config.get("players", [])
+    if not player_list_cfg:
+        await interaction.response.send_message("No players configured!")
         return
 
-    player_list = "\n".join([f"• {p['summoner_name']} ({p.get('tag', 'NA1')})" for p in players])
+    lines = "\n".join([f"• {p['summoner_name']}#{p.get('tag', 'NA1')}" for p in player_list_cfg])
+    embed = discord.Embed(title="Tracked Players", description=lines, color=0x5865F2)
+    await interaction.response.send_message(embed=embed)
 
-    embed = discord.Embed(
-        title="Tracked Players",
-        description=player_list,
-        color=0x5865F2
-    )
 
-    await ctx.send(embed=embed)
-
-@bot.command()
-async def rank(ctx, *, summoner: str = None):
-    """Show current rank for a player. Usage: !rank [name#tag] (omit for all players)"""
+@bot.tree.command(name="rank", description="Show current rank. Leave blank for all players.")
+@app_commands.describe(summoner="Player name#tag (e.g. bez#7979)")
+async def rank(interaction: discord.Interaction, summoner: str = None):
     if not db:
-        await ctx.send("Bot is still starting up, try again in a moment.")
+        await interaction.response.send_message("Bot is still starting up, try again in a moment.")
         return
 
     all_players = db.get_all_players()
     if not all_players:
-        await ctx.send("No player data yet — the bot may still be initializing.")
+        await interaction.response.send_message("No player data yet — the bot may still be initializing.")
         return
 
-    # Filter to a specific player by name#tag
     if summoner:
         if "#" not in summoner:
-            await ctx.send("Please use the format `!rank name#tag` (e.g. `!rank bez#7979`).")
+            await interaction.response.send_message("Use the format `name#tag` (e.g. `bez#7979`).")
             return
         target_name, target_tag = summoner.split("#", 1)
         all_players = [
@@ -379,7 +380,7 @@ async def rank(ctx, *, summoner: str = None):
             and p.get("tag", "").lower() == target_tag.lower()
         ]
         if not all_players:
-            await ctx.send(f"No data for **{summoner}**. Make sure they're in config.json.")
+            await interaction.response.send_message(f"No data for **{summoner}**.")
             return
 
     embed = discord.Embed(title="📊 Current Ranks", color=0x5865F2)
@@ -416,23 +417,26 @@ async def rank(ctx, *, summoner: str = None):
             inline=False
         )
 
-    await ctx.send(embed=embed)
+    await interaction.response.send_message(embed=embed)
 
-@bot.command()
-async def stats(ctx, *, summoner: str = None):
-    """Show win rate and recent performance. Usage: !stats [name#tag] (omit for all)"""
+
+@bot.tree.command(name="stats", description="Show win rate and KDA. Leave blank for all players.")
+@app_commands.describe(summoner="Player name#tag (e.g. bez#7979)")
+async def stats(interaction: discord.Interaction, summoner: str = None):
     if not db:
-        await ctx.send("Bot is still starting up, try again in a moment.")
+        await interaction.response.send_message("Bot is still starting up, try again in a moment.")
         return
+
+    await interaction.response.defer()
 
     all_players = db.get_all_players()
     if not all_players:
-        await ctx.send("No player data yet — the bot may still be initializing.")
+        await interaction.followup.send("No player data yet — the bot may still be initializing.")
         return
 
     if summoner:
         if "#" not in summoner:
-            await ctx.send("Please use the format `!stats name#tag` (e.g. `!stats bez#7979`).")
+            await interaction.followup.send("Use the format `name#tag` (e.g. `bez#7979`).")
             return
         target_name, target_tag = summoner.split("#", 1)
         all_players = [
@@ -441,7 +445,7 @@ async def stats(ctx, *, summoner: str = None):
             and p.get("tag", "").lower() == target_tag.lower()
         ]
         if not all_players:
-            await ctx.send(f"No data for **{summoner}**.")
+            await interaction.followup.send(f"No data for **{summoner}**.")
             return
 
     embed = discord.Embed(title="📈 Player Stats", color=0x5865F2)
@@ -451,11 +455,10 @@ async def stats(ctx, *, summoner: str = None):
         cursor = conn.cursor()
 
         for p in all_players:
-            summoner_id = p.get("summoner_id")
+            puuid = p.get("puuid")
             name = p.get("summoner_name", "Unknown")
             tag = p.get("tag", "NA1")
 
-            # All-time record from matches table
             cursor.execute("""
                 SELECT
                     COUNT(*) as total,
@@ -465,8 +468,8 @@ async def stats(ctx, *, summoner: str = None):
                     AVG(deaths) as avg_deaths,
                     AVG(assists) as avg_assists,
                     SUM(pentakills) as total_pentas
-                FROM matches WHERE summoner_id = ?
-            """, (summoner_id,))
+                FROM matches WHERE puuid = ?
+            """, (puuid,))
             row = cursor.fetchone()
 
             total = row["total"] or 0
@@ -479,21 +482,16 @@ async def stats(ctx, *, summoner: str = None):
             total_pentas = row["total_pentas"] or 0
 
             if total == 0:
-                embed.add_field(
-                    name=f"{name}#{tag}",
-                    value="No tracked games yet.",
-                    inline=False
-                )
+                embed.add_field(name=f"{name}#{tag}", value="No tracked games yet.", inline=False)
                 continue
 
             wr = (wins / total) * 100
             wr_emoji = "🟢" if wr >= 55 else "🟡" if wr >= 45 else "🔴"
 
-            # Last 5 games
             cursor.execute("""
-                SELECT win, pentakills FROM matches WHERE summoner_id = ?
+                SELECT win, pentakills FROM matches WHERE puuid = ?
                 ORDER BY timestamp DESC LIMIT 5
-            """, (summoner_id,))
+            """, (puuid,))
             recent = cursor.fetchall()
             recent_str = " ".join(
                 ("🎆" if r["pentakills"] > 0 else "✅") if r["win"] else "❌"
@@ -508,41 +506,44 @@ async def stats(ctx, *, summoner: str = None):
             )
             embed.add_field(name=f"{name}#{tag}", value=value, inline=False)
 
-    await ctx.send(embed=embed)
+    await interaction.followup.send(embed=embed)
 
-@bot.command()
-async def history(ctx, *, target: str = None):
-    """Show last 10 matches. Usage: !history @mention  or  !history name#tag"""
+
+@bot.tree.command(name="history", description="Show last 10 matches for a player")
+@app_commands.describe(
+    member="Discord member (ping them)",
+    summoner="Or provide name#tag directly"
+)
+async def history(interaction: discord.Interaction, member: discord.Member = None, summoner: str = None):
     if not db:
-        await ctx.send("Bot is still starting up, try again in a moment.")
+        await interaction.response.send_message("Bot is still starting up, try again in a moment.")
         return
 
     summoner_name = None
     summoner_tag = None
 
-    if ctx.message.mentions:
-        # Resolve Discord mention → summoner via discord_id in config.json
-        discord_user = ctx.message.mentions[0]
+    if member:
         with open("config.json") as f:
             config = json.load(f)
         for p in config.get("players", []):
-            if str(p.get("discord_id", "")) == str(discord_user.id):
+            if str(p.get("discord_id", "")) == str(member.id):
                 summoner_name = p["summoner_name"]
                 summoner_tag = p.get("tag", "NA1")
                 break
         if not summoner_name:
-            await ctx.send(
-                f"No summoner linked to {discord_user.mention}. "
-                f"Add their `discord_id` to config.json."
+            await interaction.response.send_message(
+                f"No summoner linked to {member.mention}. Add their `discord_id` to config.json."
             )
             return
-    elif target and "#" in target:
-        summoner_name, summoner_tag = target.split("#", 1)
+    elif summoner:
+        if "#" not in summoner:
+            await interaction.response.send_message("Use the format `name#tag` (e.g. `bez#7979`).")
+            return
+        summoner_name, summoner_tag = summoner.split("#", 1)
     else:
-        await ctx.send("Usage: `!history @mention` or `!history name#tag`")
+        await interaction.response.send_message("Provide a @member or a name#tag.")
         return
 
-    # Find player in DB
     all_players = db.get_all_players()
     player = next(
         (p for p in all_players
@@ -551,20 +552,20 @@ async def history(ctx, *, target: str = None):
         None
     )
     if not player:
-        await ctx.send(f"No data for **{summoner_name}#{summoner_tag}**.")
+        await interaction.response.send_message(f"No data for **{summoner_name}#{summoner_tag}**.")
         return
 
     with sqlite3.connect(db.db_path) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT * FROM matches WHERE summoner_id = ?
+            SELECT * FROM matches WHERE puuid = ?
             ORDER BY timestamp DESC LIMIT 10
-        """, (player["summoner_id"],))
+        """, (player["puuid"],))
         matches = cursor.fetchall()
 
     if not matches:
-        await ctx.send(f"No tracked matches for **{summoner_name}#{summoner_tag}** yet.")
+        await interaction.response.send_message(f"No tracked matches for **{summoner_name}#{summoner_tag}** yet.")
         return
 
     embed = discord.Embed(
@@ -573,7 +574,7 @@ async def history(ctx, *, target: str = None):
     )
 
     for m in matches:
-        penta = m["pentakills"] > 0 if "pentakills" in m.keys() else False
+        penta = m["pentakills"] > 0
         result = ("🎆" if penta else "✅") if m["win"] else "❌"
         kda_str = f"{m['kills']}/{m['deaths']}/{m['assists']}"
         lp_str = ""
@@ -588,7 +589,270 @@ async def history(ctx, *, target: str = None):
             inline=False
         )
 
-    await ctx.send(embed=embed)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="leaderboard", description="Show all tracked players ranked by LP")
+async def leaderboard(interaction: discord.Interaction):
+    if not db:
+        await interaction.response.send_message("Bot is still starting up, try again in a moment.")
+        return
+
+    all_players = db.get_all_players()
+    if not all_players:
+        await interaction.response.send_message("No player data yet.")
+        return
+
+    def sort_key(p):
+        tier = p.get("current_tier", "Unranked").upper()
+        div = p.get("current_rank", "IV") or "IV"
+        lp = p.get("current_lp", 0)
+        if tier == "UNRANKED":
+            return (-1, 0, 0)
+        return (rank_value(tier, div), lp)
+
+    sorted_players = sorted(all_players, key=sort_key, reverse=True)
+
+    embed = discord.Embed(title="🏆 Leaderboard", color=0x5865F2)
+
+    medals = ["🥇", "🥈", "🥉"]
+    for i, p in enumerate(sorted_players):
+        name = p.get("summoner_name", "Unknown")
+        tag = p.get("tag", "NA1")
+        tier = p.get("current_tier", "Unranked")
+        division = p.get("current_rank", "")
+        lp = p.get("current_lp", 0)
+        win_streak = p.get("win_streak", 0)
+        loss_streak = p.get("loss_streak", 0)
+
+        tier_upper = tier.upper() if tier else "UNRANKED"
+        tier_emoji = DiscordHandler.RANK_EMOJIS.get(tier_upper, "❓")
+        prefix = medals[i] if i < 3 else f"`{i+1}.`"
+
+        if tier_upper in ("MASTER", "GRANDMASTER", "CHALLENGER"):
+            rank_str = f"{tier_emoji} {tier.title()} — {lp} LP"
+        elif tier_upper == "UNRANKED":
+            rank_str = "Unranked"
+        else:
+            rank_str = f"{tier_emoji} {tier.title()} {division} — {lp} LP"
+
+        streak_str = ""
+        if win_streak > 1:
+            streak_str = f" 🔥{win_streak}W"
+        elif loss_streak > 1:
+            streak_str = f" 💀{loss_streak}L"
+
+        embed.add_field(
+            name=f"{prefix} {name}#{tag}",
+            value=f"{rank_str}{streak_str}",
+            inline=False
+        )
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="add", description="Add a player to the tracker")
+@app_commands.describe(
+    name="Summoner name",
+    tag="Tag (e.g. NA1)",
+    discord_id="Discord user ID (optional, for pings)"
+)
+async def add_player(interaction: discord.Interaction, name: str, tag: str, discord_id: str = None):
+    with open("config.json", "r") as f:
+        config = json.load(f)
+
+    players_cfg = config.get("players", [])
+
+    # Check for duplicate
+    for p in players_cfg:
+        if p.get("summoner_name", "").lower() == name.lower() and p.get("tag", "").lower() == tag.lower():
+            await interaction.response.send_message(f"**{name}#{tag}** is already being tracked.")
+            return
+
+    new_player = {"summoner_name": name, "tag": tag}
+    if discord_id:
+        try:
+            new_player["discord_id"] = int(discord_id)
+        except ValueError:
+            await interaction.response.send_message("Invalid discord_id — must be a numeric user ID.")
+            return
+
+    players_cfg.append(new_player)
+    config["players"] = players_cfg
+
+    with open("config.json", "w") as f:
+        json.dump(config, f, indent=2)
+
+    embed = discord.Embed(
+        title="✅ Player Added",
+        description=f"**{name}#{tag}** will be tracked starting next poll.",
+        color=0x00FF00
+    )
+    if discord_id:
+        embed.add_field(name="Discord ID", value=discord_id, inline=True)
+
+    await interaction.response.send_message(embed=embed)
+    logger.info(f"Added player {name}#{tag} via /add command")
+
+
+@bot.tree.command(name="remove", description="Remove a player from the tracker")
+@app_commands.describe(name="Summoner name", tag="Tag (e.g. NA1)")
+async def remove_player(interaction: discord.Interaction, name: str, tag: str):
+    with open("config.json", "r") as f:
+        config = json.load(f)
+
+    players_cfg = config.get("players", [])
+    original_count = len(players_cfg)
+
+    players_cfg = [
+        p for p in players_cfg
+        if not (p.get("summoner_name", "").lower() == name.lower()
+                and p.get("tag", "").lower() == tag.lower())
+    ]
+
+    if len(players_cfg) == original_count:
+        await interaction.response.send_message(f"**{name}#{tag}** wasn't found in the tracker.")
+        return
+
+    config["players"] = players_cfg
+
+    with open("config.json", "w") as f:
+        json.dump(config, f, indent=2)
+
+    embed = discord.Embed(
+        title="🗑️ Player Removed",
+        description=f"**{name}#{tag}** has been removed. Match history is preserved in the database.",
+        color=0xFF6347
+    )
+    await interaction.response.send_message(embed=embed)
+    logger.info(f"Removed player {name}#{tag} via /remove command")
+
+
+@bot.tree.command(name="graph", description="LP over time chart. Use 'all' or a name#tag.")
+@app_commands.describe(summoner="name#tag for a specific player, or leave blank / 'all' for everyone")
+async def graph(interaction: discord.Interaction, summoner: str = None):
+    if not db:
+        await interaction.response.send_message("Bot is still starting up, try again in a moment.")
+        return
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+    except ImportError:
+        await interaction.response.send_message("matplotlib is not installed on this server.")
+        return
+
+    await interaction.response.defer()
+
+    all_players = db.get_all_players()
+    if not all_players:
+        await interaction.followup.send("No player data yet.")
+        return
+
+    # Determine which players to graph
+    show_all = summoner is None or summoner.strip().lower() == "all"
+
+    if show_all:
+        targets = all_players
+    else:
+        if "#" not in summoner:
+            await interaction.followup.send("Use `name#tag` format or leave blank for all players.")
+            return
+        tname, ttag = summoner.split("#", 1)
+        targets = [
+            p for p in all_players
+            if p.get("summoner_name", "").lower() == tname.lower()
+            and p.get("tag", "").lower() == ttag.lower()
+        ]
+        if not targets:
+            await interaction.followup.send(f"No data for **{summoner}**.")
+            return
+
+    # Division LP offsets so Y-axis is continuous within a tier
+    DIVISION_LP_OFFSET = {"I": 300, "II": 200, "III": 100, "IV": 0}
+    TIER_COLORS = {
+        "IRON": "#6c6c6c", "BRONZE": "#a0522d", "SILVER": "#aab2bd",
+        "GOLD": "#ffd700", "PLATINUM": "#00e5cc", "EMERALD": "#00c853",
+        "DIAMOND": "#4fc3f7", "MASTER": "#9c27b0", "GRANDMASTER": "#d32f2f",
+        "CHALLENGER": "#ff6f00",
+    }
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    fig.patch.set_facecolor("#2b2d31")
+    ax.set_facecolor("#2b2d31")
+    ax.tick_params(colors="white")
+    ax.spines[:].set_color("#555")
+    ax.xaxis.label.set_color("white")
+    ax.yaxis.label.set_color("white")
+    ax.title.set_color("white")
+
+    has_data = False
+
+    for p in targets:
+        puuid = p.get("puuid")
+        pname = p.get("summoner_name", "?")
+        tag = p.get("tag", "NA1")
+        snapshots = db.get_lp_snapshots(puuid, limit=50)
+        if not snapshots:
+            continue
+
+        has_data = True
+        xs, ys = [], []
+        for s in snapshots:
+            try:
+                ts = datetime.fromisoformat(s["timestamp"])
+            except Exception:
+                continue
+            tier = (s.get("tier") or "IRON").upper()
+            division = s.get("rank") or "IV"
+            raw_lp = s.get("lp", 0)
+            # Relative LP within tier: 0 (IV) to 400 (I max)
+            offset = DIVISION_LP_OFFSET.get(division, 0)
+            relative_lp = offset + raw_lp
+            xs.append(ts)
+            ys.append(relative_lp)
+
+        if not xs:
+            continue
+
+        # Use tier color of most recent snapshot
+        last_tier = (snapshots[-1].get("tier") or "IRON").upper()
+        color = TIER_COLORS.get(last_tier, "#ffffff")
+        label = f"{pname}#{tag}" if show_all else pname
+        ax.plot(xs, ys, marker="o", markersize=3, linewidth=1.5, color=color, label=label)
+
+    if not has_data:
+        await interaction.followup.send("No LP snapshots yet — the bot needs to run a few cycles first.")
+        plt.close(fig)
+        return
+
+    # Division boundary lines
+    for div_label, offset in DIVISION_LP_OFFSET.items():
+        ax.axhline(y=offset, color="#555", linewidth=0.7, linestyle="--", alpha=0.6)
+        ax.text(ax.get_xlim()[0] if ax.get_xlim()[0] != 0 else 0,
+                offset + 3, div_label, color="#aaa", fontsize=7, va="bottom")
+
+    ax.set_ylim(0, 410)
+    ax.set_yticks([0, 100, 200, 300, 400])
+    ax.set_yticklabels(["0 LP (IV)", "100 LP (III)", "200 LP (II)", "300 LP (I)", "400 LP"])
+    ax.set_ylabel("LP (relative within tier)", color="white")
+    ax.set_xlabel("Time", color="white")
+    title = "LP Over Time — All Players" if show_all else f"LP Over Time — {targets[0]['summoner_name']}#{targets[0]['tag']}"
+    ax.set_title(title, color="white")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d %H:%M"))
+    fig.autofmt_xdate(rotation=30)
+    if show_all:
+        ax.legend(facecolor="#3b3d41", labelcolor="white", fontsize=8)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+
+    await interaction.followup.send(file=discord.File(buf, filename="lp_graph.png"))
+
 
 # Run the bot
 if __name__ == "__main__":
@@ -596,7 +860,7 @@ if __name__ == "__main__":
     if not token:
         logger.error("DISCORD_TOKEN not found in .env file")
         exit(1)
-    
+
     try:
         bot.run(token)
     except Exception as e:

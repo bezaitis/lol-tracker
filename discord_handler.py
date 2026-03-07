@@ -85,6 +85,8 @@ class DiscordHandler:
         gold_diff = match_data.get("gold_diff")
         inting_emoji = match_data.get("inting_emoji", "💀")
         pentakills = match_data.get("pentakills", 0)
+        cs_per_min = match_data.get("cs_per_min")
+        position = match_data.get("position")
 
         # Parse player name and tag for op.gg link
         if "#" in player_name:
@@ -127,12 +129,20 @@ class DiscordHandler:
             inline=True
         )
 
+        # Position
+        if position:
+            embed.add_field(name="Position", value=position, inline=True)
+
         # Game duration
         embed.add_field(
             name="Duration",
             value=duration,
             inline=True
         )
+
+        # CS/min
+        if cs_per_min is not None:
+            embed.add_field(name="CS/min", value=str(cs_per_min), inline=True)
 
         # LP — skip entirely for backfill matches (new_lp is None); handle rank change edge cases
         if new_lp is None and not promoted and not demoted:
