@@ -971,6 +971,43 @@ async def graph(interaction: discord.Interaction, summoner: str = None):
     await interaction.followup.send(file=discord.File(buf, filename="lp_graph.png"))
 
 
+@bot.tree.command(name="help", description="Show all bot commands and what they do")
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="📖 LoL Tracker — Commands",
+        description="Tracks your friends' ranked games and posts results in real time.",
+        color=0x5865F2
+    )
+
+    embed.add_field(
+        name="📊 Info",
+        value=(
+            "`/rank [summoner]` — Current rank & LP for all players (or one)\n"
+            "`/stats [@member | summoner]` — Win rate, KDA, fav champ & role, last 10 games\n"
+            "`/history [@member | summoner]` — Last 10 match results\n"
+            "`/leaderboard` — All players ranked by LP\n"
+            "`/players` — List every tracked summoner\n"
+            "`/graph [summoner]` — LP over time chart"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="⚙️ Management",
+        value=(
+            "`/add <name> <tag> [@member]` — Add a player to the tracker\n"
+            "`/remove <name> <tag>` or `/remove @member` — Remove a player"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🔧 Misc",
+        value="`/ping` — Check bot latency\n`/help` — Show this message",
+        inline=False
+    )
+    embed.set_footer(text="Bot checks for new games every 60 seconds.")
+    await interaction.response.send_message(embed=embed)
+
+
 # Run the bot
 if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN")
