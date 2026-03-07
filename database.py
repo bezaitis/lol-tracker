@@ -87,6 +87,13 @@ class Database:
 
             conn.commit()
 
+            # Migration: add position column if it doesn't exist yet
+            try:
+                cursor.execute("ALTER TABLE matches ADD COLUMN position TEXT DEFAULT NULL")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
     def add_or_update_player(self, puuid: str, summoner_name: str, tag: str):
         """Add or update a player in the database."""
         with sqlite3.connect(self.db_path) as conn:
@@ -159,7 +166,7 @@ class Database:
 
     def add_match(self, match_id: str, puuid: str, win: bool, champion: str,
                   kills: int, deaths: int, assists: int, lp_change: int, new_lp: int,
-                  game_duration: int, pentakills: int = 0):
+                  game_duration: int, pentakills: int = 0, position: str = None):
         """Record a match result and stamp last_match_id on the player row."""
         kda = (kills + assists) / max(deaths, 1)
 
@@ -168,10 +175,10 @@ class Database:
             cursor.execute("""
                 INSERT OR IGNORE INTO matches
                 (match_id, puuid, win, champion, kills, deaths, assists, kda,
-                 lp_change, new_lp, game_duration, pentakills)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 lp_change, new_lp, game_duration, pentakills, position)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (match_id, puuid, win, champion, kills, deaths, assists, kda,
-                  lp_change, new_lp, game_duration, pentakills))
+                  lp_change, new_lp, game_duration, pentakills, position))
             cursor.execute(
                 "UPDATE players SET last_match_id = ? WHERE puuid = ?",
                 (match_id, puuid)

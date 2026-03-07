@@ -131,7 +131,7 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
     discord_id = player_config.get("discord_id")
 
     try:
-        summoner = riot.get_summoner_by_name(summoner_name, tag)
+        summoner = await asyncio.to_thread(riot.get_summoner_by_name, summoner_name, tag)
         if not summoner:
             logger.warning(f"Could not find summoner: {summoner_name}")
             return
@@ -140,7 +140,7 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
 
         db.add_or_update_player(puuid, summoner_name, tag)
 
-        ranked_stats = riot.get_ranked_stats(puuid=puuid)
+        ranked_stats = await asyncio.to_thread(riot.get_ranked_stats, puuid=puuid)
         if not ranked_stats:
             logger.warning(f"No ranked stats for {summoner_name}")
             return
@@ -191,7 +191,7 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
                     logger.info(f"{summoner_name} ranked DOWN: {old_rank_str} → {new_rank_str}")
                 await channel.send(embed=rank_embed)
 
-        recent_matches = riot.get_recent_matches(puuid, start=0, count=3)
+        recent_matches = await asyncio.to_thread(riot.get_recent_matches, puuid, 0, 3)
         if not recent_matches:
             logger.debug(f"No recent matches for {summoner_name}")
             return
@@ -216,7 +216,7 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
         for i, match_id in enumerate(new_match_ids):
             is_latest = (i == len(new_match_ids) - 1)
 
-            match_data = riot.get_match_details(match_id)
+            match_data = await asyncio.to_thread(riot.get_match_details, match_id)
             if not match_data:
                 logger.warning(f"Could not get match details for {match_id}")
                 db.update_last_match_id(puuid, match_id)
@@ -294,7 +294,8 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
                 lp_change=lp_change,
                 new_lp=lp,
                 game_duration=game_duration,
-                pentakills=pentakills
+                pentakills=pentakills,
+                position=position
             )
 
             match_info = {
@@ -321,7 +322,8 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
 
             embed = DiscordHandler.create_match_embed(f"{summoner_name}#{tag}", match_info)
             await channel.send(embed=embed)
-            if discord_id:
+            # Only ping on the latest match in a batch to avoid spam
+            if discord_id and is_latest:
                 if win:
                     await channel.send(f"<@{discord_id}> is gapping! 🤯")
                 else:
@@ -421,8 +423,11 @@ async def rank(interaction: discord.Interaction, summoner: str = None):
 
 
 @bot.tree.command(name="stats", description="Show win rate and KDA. Leave blank for all players.")
-@app_commands.describe(summoner="Player name#tag (e.g. bez#7979)")
-async def stats(interaction: discord.Interaction, summoner: str = None):
+@app_commands.describe(
+    member="Discord member (ping them)",
+    summoner="Or provide name#tag directly"
+)
+async def stats(interaction: discord.Interaction, member: discord.Member = None, summoner: str = None):
     if not db:
         await interaction.response.send_message("Bot is still starting up, try again in a moment.")
         return
@@ -434,7 +439,25 @@ async def stats(interaction: discord.Interaction, summoner: str = None):
         await interaction.followup.send("No player data yet — the bot may still be initializing.")
         return
 
-    if summoner:
+    if member:
+        with open("config.json") as f:
+            config = json.load(f)
+        target = next(
+            (p for p in config.get("players", []) if str(p.get("discord_id", "")) == str(member.id)),
+            None
+        )
+        if not target:
+            await interaction.followup.send(f"No summoner linked to {member.mention}. Add their `discord_id` to config.json.")
+            return
+        all_players = [
+            p for p in all_players
+            if p.get("summoner_name", "").lower() == target["summoner_name"].lower()
+            and p.get("tag", "").lower() == target.get("tag", "").lower()
+        ]
+        if not all_players:
+            await interaction.followup.send(f"No tracked data for **{target['summoner_name']}#{target.get('tag', '')}** yet.")
+            return
+    elif summoner:
         if "#" not in summoner:
             await interaction.followup.send("Use the format `name#tag` (e.g. `bez#7979`).")
             return
@@ -488,20 +511,42 @@ async def stats(interaction: discord.Interaction, summoner: str = None):
             wr = (wins / total) * 100
             wr_emoji = "🟢" if wr >= 55 else "🟡" if wr >= 45 else "🔴"
 
+            # Favorite champion (most played overall)
+            cursor.execute("""
+                SELECT champion, COUNT(*) as cnt FROM matches
+                WHERE puuid = ? GROUP BY champion ORDER BY cnt DESC LIMIT 1
+            """, (puuid,))
+            fav_champ_row = cursor.fetchone()
+            fav_champ = fav_champ_row["champion"] if fav_champ_row else "N/A"
+
+            # Favorite role (most played, exclude NULL/empty)
+            cursor.execute("""
+                SELECT position, COUNT(*) as cnt FROM matches
+                WHERE puuid = ? AND position IS NOT NULL AND position != ''
+                GROUP BY position ORDER BY cnt DESC LIMIT 1
+            """, (puuid,))
+            fav_role_row = cursor.fetchone()
+            fav_role = fav_role_row["position"] if fav_role_row else None
+
+            # Last 10 matches (no spaces between emojis to keep it compact)
             cursor.execute("""
                 SELECT win, pentakills FROM matches WHERE puuid = ?
-                ORDER BY timestamp DESC LIMIT 5
+                ORDER BY timestamp DESC LIMIT 10
             """, (puuid,))
             recent = cursor.fetchall()
-            recent_str = " ".join(
+            recent_str = "".join(
                 ("🎆" if r["pentakills"] > 0 else "✅") if r["win"] else "❌"
                 for r in recent
             )
 
-            penta_str = f" · 🎆 **{total_pentas} Penta{'kill' if total_pentas == 1 else 'kills'}**" if total_pentas > 0 else ""
+            penta_str = f" · 🎆 **{total_pentas}× Penta**" if total_pentas > 0 else ""
+            fav_line = f"Most played: **{fav_champ}**"
+            if fav_role:
+                fav_line += f" · **{fav_role}**"
             value = (
-                f"{wr_emoji} **{wr:.1f}% WR** ({wins}W / {losses}L){penta_str}\n"
+                f"{wr_emoji} **{wr:.1f}% WR** ({wins}W/{losses}L){penta_str}\n"
                 f"Avg KDA: **{avg_k:.1f}/{avg_d:.1f}/{avg_a:.1f}** ({avg_kda:.2f})\n"
+                f"{fav_line}\n"
                 f"Last {len(recent)}: {recent_str}"
             )
             embed.add_field(name=f"{name}#{tag}", value=value, inline=False)
@@ -655,27 +700,35 @@ async def leaderboard(interaction: discord.Interaction):
 @app_commands.describe(
     name="Summoner name",
     tag="Tag (e.g. NA1)",
-    discord_id="Discord user ID (optional, for pings)"
+    member="Discord member to link (ping them)",
+    discord_id="Or provide Discord user ID directly"
 )
-async def add_player(interaction: discord.Interaction, name: str, tag: str, discord_id: str = None):
+async def add_player(interaction: discord.Interaction, name: str, tag: str,
+                     member: discord.Member = None, discord_id: str = None):
+    # Resolve discord ID from member mention or raw ID string
+    resolved_id = None
+    if member:
+        resolved_id = member.id
+    elif discord_id:
+        try:
+            resolved_id = int(discord_id)
+        except ValueError:
+            await interaction.response.send_message("Invalid discord_id — must be a numeric user ID.")
+            return
+
     with open("config.json", "r") as f:
         config = json.load(f)
 
     players_cfg = config.get("players", [])
 
-    # Check for duplicate
     for p in players_cfg:
         if p.get("summoner_name", "").lower() == name.lower() and p.get("tag", "").lower() == tag.lower():
             await interaction.response.send_message(f"**{name}#{tag}** is already being tracked.")
             return
 
     new_player = {"summoner_name": name, "tag": tag}
-    if discord_id:
-        try:
-            new_player["discord_id"] = int(discord_id)
-        except ValueError:
-            await interaction.response.send_message("Invalid discord_id — must be a numeric user ID.")
-            return
+    if resolved_id:
+        new_player["discord_id"] = resolved_id
 
     players_cfg.append(new_player)
     config["players"] = players_cfg
@@ -688,30 +741,50 @@ async def add_player(interaction: discord.Interaction, name: str, tag: str, disc
         description=f"**{name}#{tag}** will be tracked starting next poll.",
         color=0x00FF00
     )
-    if discord_id:
-        embed.add_field(name="Discord ID", value=discord_id, inline=True)
+    if resolved_id:
+        embed.add_field(name="Discord User", value=f"<@{resolved_id}>", inline=True)
 
     await interaction.response.send_message(embed=embed)
     logger.info(f"Added player {name}#{tag} via /add command")
 
 
 @bot.tree.command(name="remove", description="Remove a player from the tracker")
-@app_commands.describe(name="Summoner name", tag="Tag (e.g. NA1)")
-async def remove_player(interaction: discord.Interaction, name: str, tag: str):
+@app_commands.describe(
+    name="Summoner name (or leave blank if using @member)",
+    tag="Tag (e.g. NA1)",
+    member="Or remove by pinging the Discord member"
+)
+async def remove_player(interaction: discord.Interaction, name: str = None, tag: str = None,
+                        member: discord.Member = None):
+    if not name and not member:
+        await interaction.response.send_message("Provide a summoner `name`/`tag` or a @member to remove.")
+        return
+
     with open("config.json", "r") as f:
         config = json.load(f)
 
     players_cfg = config.get("players", [])
     original_count = len(players_cfg)
 
-    players_cfg = [
-        p for p in players_cfg
-        if not (p.get("summoner_name", "").lower() == name.lower()
-                and p.get("tag", "").lower() == tag.lower())
-    ]
+    if member:
+        players_cfg = [
+            p for p in players_cfg
+            if str(p.get("discord_id", "")) != str(member.id)
+        ]
+        identifier = member.mention
+    else:
+        if not tag:
+            await interaction.response.send_message("Provide both `name` and `tag` to remove by summoner name.")
+            return
+        players_cfg = [
+            p for p in players_cfg
+            if not (p.get("summoner_name", "").lower() == name.lower()
+                    and p.get("tag", "").lower() == tag.lower())
+        ]
+        identifier = f"**{name}#{tag}**"
 
     if len(players_cfg) == original_count:
-        await interaction.response.send_message(f"**{name}#{tag}** wasn't found in the tracker.")
+        await interaction.response.send_message(f"{identifier} wasn't found in the tracker.")
         return
 
     config["players"] = players_cfg
@@ -721,11 +794,11 @@ async def remove_player(interaction: discord.Interaction, name: str, tag: str):
 
     embed = discord.Embed(
         title="🗑️ Player Removed",
-        description=f"**{name}#{tag}** has been removed. Match history is preserved in the database.",
+        description=f"{identifier} has been removed. Match history is preserved in the database.",
         color=0xFF6347
     )
     await interaction.response.send_message(embed=embed)
-    logger.info(f"Removed player {name}#{tag} via /remove command")
+    logger.info(f"Removed player {identifier} via /remove command")
 
 
 @bot.tree.command(name="graph", description="LP over time chart. Use 'all' or a name#tag.")
@@ -751,7 +824,6 @@ async def graph(interaction: discord.Interaction, summoner: str = None):
         await interaction.followup.send("No player data yet.")
         return
 
-    # Determine which players to graph
     show_all = summoner is None or summoner.strip().lower() == "all"
 
     if show_all:
@@ -770,8 +842,18 @@ async def graph(interaction: discord.Interaction, summoner: str = None):
             await interaction.followup.send(f"No data for **{summoner}**.")
             return
 
-    # Division LP offsets so Y-axis is continuous within a tier
-    DIVISION_LP_OFFSET = {"I": 300, "II": 200, "III": 100, "IV": 0}
+    # --- LP scale helpers ---
+    _TIERS = [
+        "IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM",
+        "EMERALD", "DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER"
+    ]
+    _DIV_OFFSET = {"IV": 0, "III": 100, "II": 200, "I": 300}
+    _POOLED = {"MASTER", "GRANDMASTER", "CHALLENGER"}
+    _ABBREV = {
+        "IRON": "Irn", "BRONZE": "Brz", "SILVER": "Slv", "GOLD": "Gld",
+        "PLATINUM": "Plt", "EMERALD": "Emr", "DIAMOND": "Dia",
+        "MASTER": "Master", "GRANDMASTER": "GM", "CHALLENGER": "Chall",
+    }
     TIER_COLORS = {
         "IRON": "#6c6c6c", "BRONZE": "#a0522d", "SILVER": "#aab2bd",
         "GOLD": "#ffd700", "PLATINUM": "#00e5cc", "EMERALD": "#00c853",
@@ -779,67 +861,102 @@ async def graph(interaction: discord.Interaction, summoner: str = None):
         "CHALLENGER": "#ff6f00",
     }
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    fig.patch.set_facecolor("#2b2d31")
-    ax.set_facecolor("#2b2d31")
-    ax.tick_params(colors="white")
-    ax.spines[:].set_color("#555")
-    ax.xaxis.label.set_color("white")
-    ax.yaxis.label.set_color("white")
-    ax.title.set_color("white")
+    def to_abs_lp(tier: str, division: str, lp: int) -> int:
+        t = (tier or "IRON").upper()
+        t_idx = _TIERS.index(t) if t in _TIERS else 0
+        if t in _POOLED:
+            return t_idx * 400 + lp
+        return t_idx * 400 + _DIV_OFFSET.get((division or "IV").upper(), 0) + lp
 
-    has_data = False
+    def abs_to_label(abs_lp: int) -> str:
+        t_idx = abs_lp // 400
+        if t_idx >= len(_TIERS):
+            return ""
+        t = _TIERS[t_idx]
+        abbrev = _ABBREV.get(t, t.title())
+        if t in _POOLED:
+            lp_within = abs_lp % 400
+            return f"{abbrev} {lp_within}LP" if lp_within else abbrev
+        div = ["IV", "III", "II", "I"][(abs_lp % 400) // 100]
+        return f"{abbrev} {div}"
+
+    # --- Collect all absolute LP values and build series ---
+    all_abs_vals = []
+    player_series = []  # (xs, ys, label, color)
 
     for p in targets:
         puuid = p.get("puuid")
         pname = p.get("summoner_name", "?")
-        tag = p.get("tag", "NA1")
+        ptag = p.get("tag", "NA1")
         snapshots = db.get_lp_snapshots(puuid, limit=50)
         if not snapshots:
             continue
 
-        has_data = True
         xs, ys = [], []
         for s in snapshots:
             try:
                 ts = datetime.fromisoformat(s["timestamp"])
             except Exception:
                 continue
-            tier = (s.get("tier") or "IRON").upper()
-            division = s.get("rank") or "IV"
-            raw_lp = s.get("lp", 0)
-            # Relative LP within tier: 0 (IV) to 400 (I max)
-            offset = DIVISION_LP_OFFSET.get(division, 0)
-            relative_lp = offset + raw_lp
+            abs_val = to_abs_lp(s.get("tier") or "IRON", s.get("rank") or "IV", s.get("lp", 0))
             xs.append(ts)
-            ys.append(relative_lp)
+            ys.append(abs_val)
+            all_abs_vals.append(abs_val)
 
-        if not xs:
-            continue
+        if xs:
+            last_tier = (snapshots[-1].get("tier") or "IRON").upper()
+            color = TIER_COLORS.get(last_tier, "#ffffff")
+            label = f"{pname}#{ptag}" if show_all else pname
+            player_series.append((xs, ys, label, color))
 
-        # Use tier color of most recent snapshot
-        last_tier = (snapshots[-1].get("tier") or "IRON").upper()
-        color = TIER_COLORS.get(last_tier, "#ffffff")
-        label = f"{pname}#{tag}" if show_all else pname
-        ax.plot(xs, ys, marker="o", markersize=3, linewidth=1.5, color=color, label=label)
-
-    if not has_data:
+    if not all_abs_vals:
         await interaction.followup.send("No LP snapshots yet — the bot needs to run a few cycles first.")
-        plt.close(fig)
         return
 
-    # Division boundary lines
-    for div_label, offset in DIVISION_LP_OFFSET.items():
-        ax.axhline(y=offset, color="#555", linewidth=0.7, linestyle="--", alpha=0.6)
-        ax.text(ax.get_xlim()[0] if ax.get_xlim()[0] != 0 else 0,
-                offset + 3, div_label, color="#aaa", fontsize=7, va="bottom")
+    min_abs = min(all_abs_vals)
+    max_abs = max(all_abs_vals)
 
-    ax.set_ylim(0, 410)
-    ax.set_yticks([0, 100, 200, 300, 400])
-    ax.set_yticklabels(["0 LP (IV)", "100 LP (III)", "200 LP (II)", "300 LP (I)", "400 LP"])
-    ax.set_ylabel("LP (relative within tier)", color="white")
+    # Y-axis: start of tier containing the lowest player → start of tier above the highest
+    y_min = (min_abs // 400) * 400
+    y_max = ((max_abs // 400) + 1) * 400
+
+    y_ticks = list(range(y_min, y_max + 1, 100))
+    y_labels = [abs_to_label(y) for y in y_ticks]
+
+    # Taller figure when spanning many divisions
+    fig_h = max(5.0, len(y_ticks) * 0.42)
+    fig, ax = plt.subplots(figsize=(10, fig_h))
+    fig.patch.set_facecolor("#2b2d31")
+    ax.set_facecolor("#2b2d31")
+    ax.tick_params(colors="white", labelsize=7)
+    ax.spines[:].set_color("#555")
+    ax.xaxis.label.set_color("white")
+    ax.yaxis.label.set_color("white")
+    ax.title.set_color("white")
+
+    for xs, ys, label, color in player_series:
+        ax.plot(xs, ys, marker="o", markersize=3, linewidth=1.5, color=color, label=label)
+
+    # Gridlines: heavier at tier boundaries (every 400 LP), faint at divisions (every 100 LP)
+    for tick in y_ticks:
+        is_tier = (tick % 400 == 0)
+        ax.axhline(
+            y=tick,
+            color="#888" if is_tier else "#444",
+            linewidth=0.9 if is_tier else 0.4,
+            linestyle="--",
+            alpha=0.85 if is_tier else 0.4,
+        )
+
+    ax.set_ylim(y_min, y_max)
+    ax.set_yticks(y_ticks)
+    ax.set_yticklabels(y_labels)
+    ax.set_ylabel("Rank", color="white")
     ax.set_xlabel("Time", color="white")
-    title = "LP Over Time — All Players" if show_all else f"LP Over Time — {targets[0]['summoner_name']}#{targets[0]['tag']}"
+    title = (
+        "LP Over Time — All Players" if show_all
+        else f"LP Over Time — {targets[0]['summoner_name']}#{targets[0]['tag']}"
+    )
     ax.set_title(title, color="white")
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d %H:%M"))
     fig.autofmt_xdate(rotation=30)
