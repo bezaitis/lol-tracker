@@ -1,6 +1,6 @@
 import sqlite3
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import logging
 
@@ -85,6 +85,32 @@ class Database:
                 )
             """)
 
+            # Clash tournament events table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS clash_events (
+                    tournament_id TEXT PRIMARY KEY,
+                    name TEXT,
+                    message_id TEXT,
+                    channel_id TEXT,
+                    start_time INTEGER,
+                    schedule_json TEXT,
+                    reminded INTEGER DEFAULT 0
+                )
+            """)
+
+            # Clash RSVP signups table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS clash_signups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tournament_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    discord_name TEXT,
+                    reacted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(tournament_id, user_id),
+                    FOREIGN KEY (tournament_id) REFERENCES clash_events(tournament_id)
+                )
+            """)
+
             conn.commit()
 
             # Migration: add position column if it doesn't exist yet
@@ -126,7 +152,7 @@ class Database:
             return [dict(row) for row in cursor.fetchall()]
 
     def update_player_rank(self, puuid: str, tier: str, rank: str, lp: int):
-        """Update player's current rank and LP, and record an LP snapshot."""
+        """Update player's current rank and LP, and record an LP snapshot only when it changes."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -134,10 +160,16 @@ class Database:
                 SET current_tier = ?, current_rank = ?, current_lp = ?, last_checked = CURRENT_TIMESTAMP
                 WHERE puuid = ?
             """, (tier, rank, lp, puuid))
-            # Record snapshot for /graph
+            # Only snapshot when LP/tier/rank actually changed
             cursor.execute("""
-                INSERT INTO lp_snapshots (puuid, lp, tier, rank) VALUES (?, ?, ?, ?)
-            """, (puuid, lp, tier, rank))
+                SELECT lp, tier, rank FROM lp_snapshots
+                WHERE puuid = ? ORDER BY timestamp DESC LIMIT 1
+            """, (puuid,))
+            last = cursor.fetchone()
+            if last is None or last[0] != lp or last[1] != tier or last[2] != rank:
+                cursor.execute("""
+                    INSERT INTO lp_snapshots (puuid, lp, tier, rank) VALUES (?, ?, ?, ?)
+                """, (puuid, lp, tier, rank))
             conn.commit()
 
     def update_streaks(self, puuid: str, win: bool):
@@ -244,16 +276,105 @@ class Database:
             """, (puuid,))
             conn.commit()
 
-    def get_lp_snapshots(self, puuid: str, limit: int = 50) -> list:
-        """Get the last N LP snapshots for a player (oldest first)."""
+    def get_lp_snapshots(self, puuid: str, days: int = 90) -> list:
+        """Get LP snapshots for a player from the last N days (oldest first)."""
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT lp, tier, rank, timestamp FROM lp_snapshots
-                WHERE puuid = ?
-                ORDER BY timestamp DESC LIMIT ?
-            """, (puuid, limit))
-            rows = cursor.fetchall()
-            # Return oldest-first for charting
-            return [dict(r) for r in reversed(rows)]
+                WHERE puuid = ? AND timestamp >= datetime('now', ?)
+                ORDER BY timestamp ASC
+            """, (puuid, f'-{days} days'))
+            return [dict(r) for r in cursor.fetchall()]
+
+    # ---------------------------------------------------------------------------
+    # Clash methods
+    # ---------------------------------------------------------------------------
+
+    def save_clash_event(self, tournament_id: str, name: str, message_id: str,
+                         channel_id: str, start_time: int, schedule: list):
+        """Persist a clash tournament event after posting its embed."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO clash_events
+                (tournament_id, name, message_id, channel_id, start_time, schedule_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (tournament_id, name, message_id, channel_id, start_time, json.dumps(schedule)))
+            conn.commit()
+
+    def get_clash_event(self, tournament_id: str) -> dict:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM clash_events WHERE tournament_id = ?", (tournament_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_clash_event_by_message(self, message_id: str) -> dict:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM clash_events WHERE message_id = ?", (message_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def add_clash_signup(self, tournament_id: str, user_id: str, discord_name: str):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR IGNORE INTO clash_signups (tournament_id, user_id, discord_name)
+                VALUES (?, ?, ?)
+            """, (tournament_id, user_id, discord_name))
+            conn.commit()
+
+    def remove_clash_signup(self, tournament_id: str, user_id: str):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                DELETE FROM clash_signups WHERE tournament_id = ? AND user_id = ?
+            """, (tournament_id, user_id))
+            conn.commit()
+
+    def get_clash_signups(self, tournament_id: str) -> list:
+        """Return signups for a tournament ordered by sign-up time (oldest first)."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT user_id, discord_name, reacted_at FROM clash_signups
+                WHERE tournament_id = ? ORDER BY reacted_at ASC
+            """, (tournament_id,))
+            return [dict(r) for r in cursor.fetchall()]
+
+    def get_unreminded_clash_events(self) -> list:
+        """Return clash events starting within the next 48 h that haven't been reminded."""
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        window_ms = now_ms + (48 * 3600 * 1000)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM clash_events
+                WHERE reminded = 0 AND start_time > ? AND start_time <= ?
+            """, (now_ms, window_ms))
+            return [dict(r) for r in cursor.fetchall()]
+
+    def get_all_active_clash_events(self) -> list:
+        """Return all clash events that haven't started yet (for re-attaching views on restart)."""
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM clash_events WHERE start_time > ?", (now_ms,))
+            return [dict(r) for r in cursor.fetchall()]
+
+    def mark_clash_reminded(self, tournament_id: str):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE clash_events SET reminded = 1 WHERE tournament_id = ?",
+                (tournament_id,)
+            )
+            conn.commit()

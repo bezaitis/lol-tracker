@@ -146,6 +146,11 @@ class RiotClient:
         endpoint = f"/lol/match/v5/matches/{match_id}"
         return self._make_request(endpoint, self.AMERICAS_BASE_URL)
     
+    def get_clash_tournaments(self) -> Optional[list]:
+        """Get upcoming Clash tournaments for NA."""
+        endpoint = "/lol/clash/v1/tournaments"
+        return self._make_request(endpoint, self.NA1_BASE_URL)
+
     def get_player_in_match(self, match_data: Dict[str, Any], puuid: str) -> Optional[Dict[str, Any]]:
         """
         Extract a specific player's stats from match data.

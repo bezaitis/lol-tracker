@@ -8,6 +8,7 @@ import logging
 import asyncio
 import sqlite3
 import time
+import colorsys
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -93,6 +94,56 @@ async def on_ready():
         check_matches.start()
         logger.info("Match tracking loop started")
 
+    if not check_clash_reminders.is_running():
+        check_clash_reminders.start()
+        logger.info("Clash reminder loop started")
+
+    # Re-attach persistent clash views so buttons work after a restart
+    for clash_event in db.get_all_active_clash_events():
+        view = ClashSignupView(clash_event["tournament_id"])
+        bot.add_view(view, message_id=int(clash_event["message_id"]))
+
+class ClashSignupView(discord.ui.View):
+    """Persistent Sign Up / Remove buttons attached to each clash embed."""
+
+    def __init__(self, tournament_id: str):
+        super().__init__(timeout=None)
+        self.tournament_id = tournament_id
+
+        btn_signup = discord.ui.Button(
+            label="Sign Up",
+            style=discord.ButtonStyle.success,
+            emoji="✅",
+            custom_id=f"clash_signup_{tournament_id}",
+        )
+        btn_signup.callback = self._signup
+        self.add_item(btn_signup)
+
+        btn_remove = discord.ui.Button(
+            label="Remove",
+            style=discord.ButtonStyle.danger,
+            emoji="❌",
+            custom_id=f"clash_remove_{tournament_id}",
+        )
+        btn_remove.callback = self._remove
+        self.add_item(btn_remove)
+
+    async def _signup(self, interaction: discord.Interaction):
+        db.add_clash_signup(self.tournament_id, str(interaction.user.id), interaction.user.display_name)
+        await self._refresh(interaction)
+
+    async def _remove(self, interaction: discord.Interaction):
+        db.remove_clash_signup(self.tournament_id, str(interaction.user.id))
+        await self._refresh(interaction)
+
+    async def _refresh(self, interaction: discord.Interaction):
+        event = db.get_clash_event(self.tournament_id)
+        signups = db.get_clash_signups(self.tournament_id)
+        schedule = json.loads(event["schedule_json"])
+        embed = _build_clash_embed(event["name"], schedule, signups)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
 @tasks.loop(minutes=1)
 async def check_matches():
     """Main loop - check all players every 60 seconds"""
@@ -117,6 +168,31 @@ async def check_matches():
 
     except Exception as e:
         logger.error(f"Error in check_matches loop: {e}")
+
+@tasks.loop(minutes=30)
+async def check_clash_reminders():
+    """Ping the first 5 signed-up players for any Clash starting within 48 h."""
+    if not db or not channel:
+        return
+    for event in db.get_unreminded_clash_events():
+        signups = db.get_clash_signups(event["tournament_id"])
+        starters = signups[:5]
+        if not starters:
+            db.mark_clash_reminded(event["tournament_id"])
+            continue
+        start_ts = event["start_time"] // 1000
+        mentions = " ".join(f"<@{s['user_id']}>" for s in starters)
+        lines = [
+            f"🏆 **Clash Reminder — {event['name']}**",
+            f"Tournament starts <t:{start_ts}:R> (<t:{start_ts}:F>)",
+            f"\n**Starting 5:** {mentions}",
+        ]
+        if len(signups) > 5:
+            standby_names = ", ".join(s["discord_name"] for s in signups[5:])
+            lines.append(f"**Standby:** {standby_names}")
+        await channel.send("\n".join(lines))
+        db.mark_clash_reminded(event["tournament_id"])
+
 
 async def check_player_matches(summoner_name: str, tag: str = "NA1", player_config: dict = None):
     """Check a single player for new matches, processing up to 3 missed games in order."""
@@ -336,6 +412,48 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
 
 
 # ---------------------------------------------------------------------------
+# Clash helpers
+# ---------------------------------------------------------------------------
+
+def _build_clash_embed(name: str, schedule: list, signups: list) -> discord.Embed:
+    embed = discord.Embed(title=f"🏆 Clash: {name}", color=0xE8A838)
+
+    # Schedule: one field per non-cancelled phase
+    active = [p for p in schedule if not p.get("cancelled")]
+    sched_lines = []
+    for i, phase in enumerate(active, 1):
+        reg_ts = phase.get("registrationTime", 0) // 1000
+        start_ts = phase.get("startTime", 0) // 1000
+        label = f"Day {i}" if len(active) > 1 else "Tournament"
+        sched_lines.append(
+            f"**{label}**\nRegistration: <t:{reg_ts}:F>\nStart: <t:{start_ts}:F>"
+        )
+    embed.add_field(
+        name="📅 Schedule",
+        value="\n\n".join(sched_lines) if sched_lines else "TBD",
+        inline=False,
+    )
+
+    # Signups: first 5 = team, rest = standby
+    if signups:
+        lines = []
+        for i, s in enumerate(signups):
+            icon = "✅" if i < 5 else "⏳"
+            lines.append(f"{icon} {i + 1}. {s['discord_name']}")
+        signup_text = "\n".join(lines)
+    else:
+        signup_text = "*No signups yet*"
+    embed.add_field(
+        name=f"👥 Signed Up ({len(signups)}{'/' + str(len(signups)) if len(signups) > 5 else '/5'})",
+        value=signup_text,
+        inline=False,
+    )
+
+    embed.set_footer(text="First 5 to sign up will be pinged before the tournament · Standby players listed after")
+    return embed
+
+
+# ---------------------------------------------------------------------------
 # Slash commands
 # ---------------------------------------------------------------------------
 
@@ -519,12 +637,12 @@ async def stats(interaction: discord.Interaction, member: discord.Member = None,
             fav_champ_row = cursor.fetchone()
             fav_champ = fav_champ_row["champion"] if fav_champ_row else "N/A"
 
-            # Favorite role (most played, exclude NULL/empty)
+            # Favorite role: most common position when playing their most-played champion
             cursor.execute("""
                 SELECT position, COUNT(*) as cnt FROM matches
-                WHERE puuid = ? AND position IS NOT NULL AND position != ''
+                WHERE puuid = ? AND champion = ? AND position IS NOT NULL AND position != ''
                 GROUP BY position ORDER BY cnt DESC LIMIT 1
-            """, (puuid,))
+            """, (puuid, fav_champ))
             fav_role_row = cursor.fetchone()
             fav_role = fav_role_row["position"] if fav_role_row else None
 
@@ -801,6 +919,68 @@ async def remove_player(interaction: discord.Interaction, name: str = None, tag:
     logger.info(f"Removed player {identifier} via /remove command")
 
 
+@bot.tree.command(name="clash", description="Show upcoming Clash tournaments and sign up")
+async def clash(interaction: discord.Interaction):
+    if not db:
+        await interaction.response.send_message("Bot is still starting up, try again in a moment.")
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    tournaments = await asyncio.to_thread(riot.get_clash_tournaments)
+    if not tournaments:
+        await interaction.followup.send("No upcoming Clash tournaments found.", ephemeral=True)
+        return
+
+    now_ms = int(time.time() * 1000)
+    posted = 0
+
+    for t in tournaments:
+        tid = str(t["id"])
+        name_raw = " ".join(
+            p.replace("_", " ").title()
+            for p in [t.get("nameKey", ""), t.get("nameKeySecondary", "")]
+            if p
+        ) or "Clash Tournament"
+
+        schedule = t.get("schedule", [])
+        active = [p for p in schedule if not p.get("cancelled")]
+        if not active:
+            continue
+
+        # Skip if tournament has already started
+        earliest_start = min(p["startTime"] for p in active)
+        if earliest_start < now_ms:
+            continue
+
+        # If already posted, delete the old message and repost with current signups
+        existing = db.get_clash_event(tid)
+        if existing:
+            try:
+                old_ch = bot.get_channel(int(existing["channel_id"]))
+                if old_ch:
+                    old_msg = await old_ch.fetch_message(int(existing["message_id"]))
+                    await old_msg.delete()
+            except Exception:
+                pass  # Already deleted or inaccessible
+
+        signups = db.get_clash_signups(tid) if existing else []
+        embed = _build_clash_embed(name_raw, schedule, signups)
+        view = ClashSignupView(tid)
+        msg = await interaction.channel.send(embed=embed, view=view)
+
+        db.save_clash_event(tid, name_raw, str(msg.id), str(interaction.channel.id),
+                            earliest_start, schedule)
+        posted += 1
+
+    if posted > 0:
+        await interaction.followup.send(
+            f"Posted {posted} Clash tournament(s) above.", ephemeral=True
+        )
+    else:
+        await interaction.followup.send("No upcoming Clash tournaments found.", ephemeral=True)
+
+
 @bot.tree.command(name="graph", description="LP over time chart. Use 'all' or a name#tag.")
 @app_commands.describe(summoner="name#tag for a specific player, or leave blank / 'all' for everyone")
 async def graph(interaction: discord.Interaction, summoner: str = None):
@@ -860,6 +1040,16 @@ async def graph(interaction: discord.Interaction, summoner: str = None):
         "DIAMOND": "#4fc3f7", "MASTER": "#9c27b0", "GRANDMASTER": "#d32f2f",
         "CHALLENGER": "#ff6f00",
     }
+    def _shift_color(hex_color: str, idx: int) -> str:
+        """Vary a tier base color slightly per player index so same-tier lines are distinct."""
+        r, g, b = (int(hex_color.lstrip("#")[i:i+2], 16) / 255 for i in (0, 2, 4))
+        h, s, v = colorsys.rgb_to_hsv(r, g, b)
+        hue_steps = [0, 0.05, -0.05, 0.10, -0.10]
+        val_steps = [0, 0.15, -0.15, 0.10, -0.10]
+        h = (h + hue_steps[idx % len(hue_steps)]) % 1.0
+        v = max(0.25, min(1.0, v + val_steps[idx % len(val_steps)]))
+        r2, g2, b2 = colorsys.hsv_to_rgb(h, s, v)
+        return f"#{int(r2*255):02x}{int(g2*255):02x}{int(b2*255):02x}"
 
     def to_abs_lp(tier: str, division: str, lp: int) -> int:
         t = (tier or "IRON").upper()
@@ -883,12 +1073,13 @@ async def graph(interaction: discord.Interaction, summoner: str = None):
     # --- Collect all absolute LP values and build series ---
     all_abs_vals = []
     player_series = []  # (xs, ys, label, color)
+    tier_counts = {}  # track how many players per tier so we can vary shades
 
     for p in targets:
         puuid = p.get("puuid")
         pname = p.get("summoner_name", "?")
         ptag = p.get("tag", "NA1")
-        snapshots = db.get_lp_snapshots(puuid, limit=50)
+        snapshots = db.get_lp_snapshots(puuid)
         if not snapshots:
             continue
 
@@ -905,7 +1096,13 @@ async def graph(interaction: discord.Interaction, summoner: str = None):
 
         if xs:
             last_tier = (snapshots[-1].get("tier") or "IRON").upper()
-            color = TIER_COLORS.get(last_tier, "#ffffff")
+            base_color = TIER_COLORS.get(last_tier, "#ffffff")
+            if show_all:
+                tier_idx = tier_counts.get(last_tier, 0)
+                color = _shift_color(base_color, tier_idx)
+                tier_counts[last_tier] = tier_idx + 1
+            else:
+                color = base_color
             label = f"{pname}#{ptag}" if show_all else pname
             player_series.append((xs, ys, label, color))
 
@@ -958,7 +1155,18 @@ async def graph(interaction: discord.Interaction, summoner: str = None):
         else f"LP Over Time — {targets[0]['summoner_name']}#{targets[0]['tag']}"
     )
     ax.set_title(title, color="white")
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d %H:%M"))
+    all_xs = [x for xs, _, _, _ in player_series for x in xs]
+    if all_xs:
+        span_days = (max(all_xs) - min(all_xs)).days
+        if span_days > 14:
+            ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
+        elif span_days > 2:
+            ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
+        else:
+            ax.xaxis.set_major_locator(mdates.HourLocator(interval=6))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d %H:%M"))
     fig.autofmt_xdate(rotation=30)
     if show_all:
         ax.legend(facecolor="#3b3d41", labelcolor="white", fontsize=8)
@@ -987,7 +1195,8 @@ async def help_command(interaction: discord.Interaction):
             "`/history [@member | summoner]` — Last 10 match results\n"
             "`/leaderboard` — All players ranked by LP\n"
             "`/players` — List every tracked summoner\n"
-            "`/graph [summoner]` — LP over time chart"
+            "`/graph [summoner]` — LP over time chart\n"
+            "`/clash` — Post upcoming Clash tournaments · React ✅ to sign up"
         ),
         inline=False
     )
