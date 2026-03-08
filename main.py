@@ -981,9 +981,12 @@ async def clash(interaction: discord.Interaction):
         await interaction.followup.send("No upcoming Clash tournaments found.", ephemeral=True)
 
 
-@bot.tree.command(name="graph", description="LP over time chart. Use 'all' or a name#tag.")
-@app_commands.describe(summoner="name#tag for a specific player, or leave blank / 'all' for everyone")
-async def graph(interaction: discord.Interaction, summoner: str = None):
+@bot.tree.command(name="graph", description="LP over time chart. Use 'all', a name#tag, or @mention.")
+@app_commands.describe(
+    member="Discord member to graph",
+    summoner="name#tag for a specific player, or leave blank / 'all' for everyone"
+)
+async def graph(interaction: discord.Interaction, member: discord.Member = None, summoner: str = None):
     if not db:
         await interaction.response.send_message("Bot is still starting up, try again in a moment.")
         return
@@ -1004,23 +1007,42 @@ async def graph(interaction: discord.Interaction, summoner: str = None):
         await interaction.followup.send("No player data yet.")
         return
 
-    show_all = summoner is None or summoner.strip().lower() == "all"
-
-    if show_all:
-        targets = all_players
-    else:
-        if "#" not in summoner:
-            await interaction.followup.send("Use `name#tag` format or leave blank for all players.")
+    if member:
+        with open("config.json") as f:
+            config = json.load(f)
+        target = next(
+            (p for p in config.get("players", []) if str(p.get("discord_id", "")) == str(member.id)),
+            None
+        )
+        if not target:
+            await interaction.followup.send(f"No summoner linked to {member.mention}.")
             return
-        tname, ttag = summoner.split("#", 1)
         targets = [
             p for p in all_players
-            if p.get("summoner_name", "").lower() == tname.lower()
-            and p.get("tag", "").lower() == ttag.lower()
+            if p.get("summoner_name", "").lower() == target["summoner_name"].lower()
+            and p.get("tag", "").lower() == target.get("tag", "").lower()
         ]
         if not targets:
-            await interaction.followup.send(f"No data for **{summoner}**.")
+            await interaction.followup.send(f"No data for **{target['summoner_name']}#{target.get('tag', '')}** yet.")
             return
+        show_all = False
+    else:
+        show_all = summoner is None or summoner.strip().lower() == "all"
+        if show_all:
+            targets = all_players
+        else:
+            if "#" not in summoner:
+                await interaction.followup.send("Use `name#tag` format, @mention, or leave blank for all players.")
+                return
+            tname, ttag = summoner.split("#", 1)
+            targets = [
+                p for p in all_players
+                if p.get("summoner_name", "").lower() == tname.lower()
+                and p.get("tag", "").lower() == ttag.lower()
+            ]
+            if not targets:
+                await interaction.followup.send(f"No data for **{summoner}**.")
+                return
 
     # --- LP scale helpers ---
     _TIERS = [
@@ -1169,7 +1191,7 @@ async def graph(interaction: discord.Interaction, summoner: str = None):
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d %H:%M"))
     fig.autofmt_xdate(rotation=30)
     if show_all:
-        ax.legend(facecolor="#3b3d41", labelcolor="white", fontsize=8)
+        ax.legend(loc="upper left", facecolor="#3b3d41", labelcolor="white", fontsize=8)
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
