@@ -1219,7 +1219,9 @@ async def graph(interaction: discord.Interaction, member: discord.Member = None,
     ax.set_title(title, color="white")
     all_xs = [x for xs, _, _, _ in player_series for x in xs]
     if all_xs:
-        span_days = (max(all_xs) - min(all_xs)).days
+        x_min, x_max = min(all_xs), max(all_xs)
+        ax.set_xlim(x_min, x_max)
+        span_days = (x_max - x_min).days
         if span_days > 14:
             ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
@@ -1229,7 +1231,7 @@ async def graph(interaction: discord.Interaction, member: discord.Member = None,
         else:
             ax.xaxis.set_major_locator(mdates.HourLocator(interval=6))
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d %H:%M"))
-    fig.autofmt_xdate(rotation=30)
+    ax.tick_params(axis="x", rotation=30)
     if show_all:
         ax.legend(loc="upper left", facecolor="#3b3d41", labelcolor="white", fontsize=8)
 
