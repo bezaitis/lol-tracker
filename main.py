@@ -1163,6 +1163,14 @@ async def graph(interaction: discord.Interaction, member: discord.Member = None,
     fig_h = max(5.0, len(y_ticks) * 0.42)
     fig, ax = plt.subplots(figsize=(10, fig_h))
     _BG = "#141518"
+    _BG_RGB = (20, 21, 24)  # #141518 as ints
+
+    def _blend(fg_hex: str, a: float) -> str:
+        """Pre-blend fg_hex onto _BG at alpha a, returning a solid hex colour."""
+        fg = [int(fg_hex.lstrip("#")[i:i+2], 16) for i in (0, 2, 4)]
+        out = [int(_BG_RGB[i] * (1 - a) + fg[i] * a) for i in range(3)]
+        return f"#{out[0]:02x}{out[1]:02x}{out[2]:02x}"
+
     fig.patch.set_facecolor(_BG)
     ax.set_facecolor(_BG)
     ax.tick_params(colors="white", labelsize=7)
@@ -1171,18 +1179,17 @@ async def graph(interaction: discord.Interaction, member: discord.Member = None,
     ax.yaxis.label.set_color("white")
     ax.title.set_color("white")
 
-    # Tier background bands
+    # Tier background bands — solid pre-blended colours (no alpha, avoids compositing)
     for i, tier in enumerate(_TIERS):
         tier_y_lo = i * 400
         tier_y_hi = (i + 1) * 400
         if tier_y_lo >= y_max or tier_y_hi <= y_min:
             continue
-        bg_color = TIER_BG_COLORS.get(tier, "#333333")
+        band_color = _blend(TIER_BG_COLORS.get(tier, "#333333"), 0.35)
         ax.axhspan(
             max(tier_y_lo, y_min),
             min(tier_y_hi, y_max),
-            facecolor=bg_color,
-            alpha=0.18,
+            facecolor=band_color,
             zorder=0,
         )
 
@@ -1227,8 +1234,10 @@ async def graph(interaction: discord.Interaction, member: discord.Member = None,
         ax.legend(loc="upper left", facecolor="#3b3d41", labelcolor="white", fontsize=8)
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
-    plt.close(fig)
+    try:
+        fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
+    finally:
+        plt.close(fig)
     buf.seek(0)
 
     await interaction.followup.send(file=discord.File(buf, filename="lp_graph.png"))
