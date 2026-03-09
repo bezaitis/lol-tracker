@@ -305,6 +305,12 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
                 continue
 
             info = match_data.get("info", {})
+            queue_id = info.get("queueId")
+            if queue_id != 420:
+                db.update_last_match_id(puuid, match_id)
+                logger.info(f"{summoner_name} — skipping non-ranked match {match_id} (queueId={queue_id})")
+                continue
+
             win = player_match.get("win", False)
             champion = player_match.get("championName", "Unknown")
             kills = player_match.get("kills", 0)
@@ -359,7 +365,7 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
             win_streak = updated_player.get("win_streak", 0)
             loss_streak = updated_player.get("loss_streak", 0)
 
-            db.add_match(
+            is_new_match = db.add_match(
                 match_id=match_id,
                 puuid=puuid,
                 win=win,
@@ -373,6 +379,10 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
                 pentakills=pentakills,
                 position=position
             )
+
+            if not is_new_match:
+                logger.warning(f"Match {match_id} already recorded for {summoner_name} — skipping Discord post")
+                continue
 
             match_info = {
                 "win": win,
@@ -1057,19 +1067,26 @@ async def graph(interaction: discord.Interaction, member: discord.Member = None,
         "MASTER": "Master", "GRANDMASTER": "GM", "CHALLENGER": "Chall",
     }
     TIER_COLORS = {
-        "IRON": "#6c6c6c", "BRONZE": "#a0522d", "SILVER": "#aab2bd",
-        "GOLD": "#ffd700", "PLATINUM": "#00e5cc", "EMERALD": "#00c853",
-        "DIAMOND": "#4fc3f7", "MASTER": "#9c27b0", "GRANDMASTER": "#d32f2f",
-        "CHALLENGER": "#ff6f00",
+        "IRON": "#a8a8a8", "BRONZE": "#e08040", "SILVER": "#d0dae8",
+        "GOLD": "#ffd700", "PLATINUM": "#00ffcc", "EMERALD": "#00ff66",
+        "DIAMOND": "#44aaff", "MASTER": "#cc44ff", "GRANDMASTER": "#ff4444",
+        "CHALLENGER": "#ff9933",
+    }
+    # Subtle background fill color per tier (flat band)
+    TIER_BG_COLORS = {
+        "IRON": "#505050", "BRONZE": "#6e3a18", "SILVER": "#4a5560",
+        "GOLD": "#6e5a00", "PLATINUM": "#006655", "EMERALD": "#005c2a",
+        "DIAMOND": "#003d80", "MASTER": "#440080", "GRANDMASTER": "#800000",
+        "CHALLENGER": "#804000",
     }
     def _shift_color(hex_color: str, idx: int) -> str:
-        """Vary a tier base color slightly per player index so same-tier lines are distinct."""
+        """Vary a tier base color per player index using wide hue steps, keeping lines bright."""
         r, g, b = (int(hex_color.lstrip("#")[i:i+2], 16) / 255 for i in (0, 2, 4))
         h, s, v = colorsys.rgb_to_hsv(r, g, b)
-        hue_steps = [0, 0.05, -0.05, 0.10, -0.10]
-        val_steps = [0, 0.15, -0.15, 0.10, -0.10]
+        hue_steps = [0, 0.08, -0.08, 0.16, -0.16, 0.24, -0.24]
         h = (h + hue_steps[idx % len(hue_steps)]) % 1.0
-        v = max(0.25, min(1.0, v + val_steps[idx % len(val_steps)]))
+        s = min(1.0, max(0.7, s))   # keep saturation high
+        v = min(1.0, max(0.8, v))   # keep brightness high
         r2, g2, b2 = colorsys.hsv_to_rgb(h, s, v)
         return f"#{int(r2*255):02x}{int(g2*255):02x}{int(b2*255):02x}"
 
@@ -1145,26 +1162,42 @@ async def graph(interaction: discord.Interaction, member: discord.Member = None,
     # Taller figure when spanning many divisions
     fig_h = max(5.0, len(y_ticks) * 0.42)
     fig, ax = plt.subplots(figsize=(10, fig_h))
-    fig.patch.set_facecolor("#2b2d31")
-    ax.set_facecolor("#2b2d31")
+    _BG = "#141518"
+    fig.patch.set_facecolor(_BG)
+    ax.set_facecolor(_BG)
     ax.tick_params(colors="white", labelsize=7)
-    ax.spines[:].set_color("#555")
+    ax.spines[:].set_color("#444")
     ax.xaxis.label.set_color("white")
     ax.yaxis.label.set_color("white")
     ax.title.set_color("white")
 
+    # Tier background bands
+    for i, tier in enumerate(_TIERS):
+        tier_y_lo = i * 400
+        tier_y_hi = (i + 1) * 400
+        if tier_y_lo >= y_max or tier_y_hi <= y_min:
+            continue
+        bg_color = TIER_BG_COLORS.get(tier, "#333333")
+        ax.axhspan(
+            max(tier_y_lo, y_min),
+            min(tier_y_hi, y_max),
+            facecolor=bg_color,
+            alpha=0.18,
+            zorder=0,
+        )
+
     for xs, ys, label, color in player_series:
-        ax.plot(xs, ys, marker="o", markersize=3, linewidth=1.5, color=color, label=label)
+        ax.plot(xs, ys, marker="o", markersize=4, linewidth=2.0, color=color, label=label)
 
     # Gridlines: heavier at tier boundaries (every 400 LP), faint at divisions (every 100 LP)
     for tick in y_ticks:
         is_tier = (tick % 400 == 0)
         ax.axhline(
             y=tick,
-            color="#888" if is_tier else "#444",
+            color="#777" if is_tier else "#333",
             linewidth=0.9 if is_tier else 0.4,
             linestyle="--",
-            alpha=0.85 if is_tier else 0.4,
+            alpha=0.9 if is_tier else 0.5,
         )
 
     ax.set_ylim(y_min, y_max)
