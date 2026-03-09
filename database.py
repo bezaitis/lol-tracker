@@ -198,8 +198,9 @@ class Database:
 
     def add_match(self, match_id: str, puuid: str, win: bool, champion: str,
                   kills: int, deaths: int, assists: int, lp_change: int, new_lp: int,
-                  game_duration: int, pentakills: int = 0, position: str = None):
-        """Record a match result and stamp last_match_id on the player row."""
+                  game_duration: int, pentakills: int = 0, position: str = None) -> bool:
+        """Record a match result and stamp last_match_id on the player row.
+        Returns True if this was a new insert, False if the match already existed."""
         kda = (kills + assists) / max(deaths, 1)
 
         with sqlite3.connect(self.db_path) as conn:
@@ -211,11 +212,13 @@ class Database:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (match_id, puuid, win, champion, kills, deaths, assists, kda,
                   lp_change, new_lp, game_duration, pentakills, position))
+            is_new = cursor.rowcount > 0
             cursor.execute(
                 "UPDATE players SET last_match_id = ? WHERE puuid = ?",
                 (match_id, puuid)
             )
             conn.commit()
+        return is_new
 
     def update_last_match_id(self, puuid: str, match_id: str):
         """Stamp last_match_id without recording full match stats (e.g. old matches on startup)."""
