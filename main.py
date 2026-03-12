@@ -318,6 +318,13 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
             assists = player_match.get("assists", 0)
             game_duration = info.get("gameDuration", 0)
 
+            # Remakes: early surrender vote before 3 min — don't count as win/loss
+            if player_match.get("gameEndedInEarlySurrender", False) and game_duration < 180:
+                db.update_last_match_id(puuid, match_id)
+                logger.info(f"{summoner_name} — remake {match_id} (duration={game_duration}s)")
+                await channel.send(f"🔄 **{summoner_name}#{tag}** — remake on {champion} (game ended in {int(game_duration)}s)")
+                continue
+
             game_end_ts_ms = info.get("gameEndTimestamp") or (
                 info.get("gameCreation", 0) + game_duration * 1000
             )
