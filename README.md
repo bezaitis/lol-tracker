@@ -30,7 +30,7 @@ A 24/7 Discord bot that tracks your friends' League of Legends ranked games and 
 
 ### SSH in
 ```bash
-ssh -i ~/Desktop/python/ssh-key-2026-03-05.key opc@163.192.105.166
+ssh -i ~/.ssh/lol-tracker.key opc@<server-ip>
 ```
 
 ### First-time install
@@ -86,7 +86,7 @@ sudo systemctl start lol-tracker
 ## Deploying Updates
 
 ```bash
-ssh -i ~/Desktop/python/ssh-key-2026-03-05.key opc@163.192.105.166
+ssh -i ~/.ssh/lol-tracker.key opc@<server-ip>
 cd /opt/lol-tracker
 git pull
 source venv/bin/activate

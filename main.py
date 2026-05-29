@@ -216,58 +216,57 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
 
         db.add_or_update_player(puuid, summoner_name, tag)
 
-        ranked_stats = await asyncio.to_thread(riot.get_ranked_stats, puuid=puuid)
-        if not ranked_stats:
-            logger.warning(f"No ranked stats for {summoner_name}")
-            return
-
-        solo_queue = None
-        for queue in ranked_stats:
-            if queue.get("queueType") == "RANKED_SOLO_5x5":
-                solo_queue = queue
-                break
-
-        if not solo_queue:
-            logger.warning(f"No solo queue ranked for {summoner_name}")
-            return
-
         player_data = db.get_player(puuid)
         old_lp = player_data.get("current_lp") if player_data else None
         old_tier = player_data.get("current_tier") if player_data else None
         old_rank = player_data.get("current_rank") if player_data else None
 
-        tier = solo_queue.get("tier", "Unranked")
-        rank = solo_queue.get("rank", "")
-        lp = solo_queue.get("leaguePoints", 0)
+        ranked_stats = await asyncio.to_thread(riot.get_ranked_stats, puuid=puuid)
+        solo_queue = None
+        if ranked_stats:
+            for queue in ranked_stats:
+                if queue.get("queueType") == "RANKED_SOLO_5x5":
+                    solo_queue = queue
+                    break
 
-        db.update_player_rank(puuid, tier, rank, lp)
-
-        # Detect rank changes and send a dedicated embed
         rank_promoted = False
         rank_demoted = False
-        if old_tier and old_tier != "Unranked" and old_tier != tier or (old_tier == tier and old_rank and old_rank != rank):
-            old_val = rank_value(old_tier, old_rank or "I")
-            new_val = rank_value(tier, rank or "I")
-            if new_val != old_val:
-                old_rank_str = f"{old_tier.title()} {old_rank}"
-                new_rank_str = f"{tier.title()} {rank}"
-                db.record_rank_change(puuid, old_tier, tier, old_rank or "", rank)
-                mention_str = f"<@{discord_id}>" if discord_id else None
-                if new_val > old_val:
-                    rank_promoted = True
-                    rank_embed = DiscordHandler.create_rank_up_embed(
-                        f"{summoner_name}#{tag}", old_rank_str, new_rank_str, mention=mention_str
-                    )
-                    logger.info(f"{summoner_name} ranked UP: {old_rank_str} → {new_rank_str}")
-                else:
-                    rank_demoted = True
-                    rank_embed = DiscordHandler.create_rank_down_embed(
-                        f"{summoner_name}#{tag}", old_rank_str, new_rank_str, mention=mention_str
-                    )
-                    logger.info(f"{summoner_name} ranked DOWN: {old_rank_str} → {new_rank_str}")
-                await channel.send(embed=rank_embed)
+        if solo_queue:
+            tier = solo_queue.get("tier", "Unranked")
+            rank = solo_queue.get("rank", "")
+            lp = solo_queue.get("leaguePoints", 0)
 
-        recent_matches = await asyncio.to_thread(riot.get_recent_matches, puuid, 0, 3)
+            db.update_player_rank(puuid, tier, rank, lp)
+
+            # Detect rank changes and send a dedicated embed
+            if old_tier and old_tier != "Unranked" and (old_tier != tier or (old_rank and old_rank != rank)):
+                old_val = rank_value(old_tier, old_rank or "I")
+                new_val = rank_value(tier, rank or "I")
+                if new_val != old_val:
+                    old_rank_str = f"{old_tier.title()} {old_rank}"
+                    new_rank_str = f"{tier.title()} {rank}"
+                    db.record_rank_change(puuid, old_tier, tier, old_rank or "", rank)
+                    mention_str = f"<@{discord_id}>" if discord_id else None
+                    if new_val > old_val:
+                        rank_promoted = True
+                        rank_embed = DiscordHandler.create_rank_up_embed(
+                            f"{summoner_name}#{tag}", old_rank_str, new_rank_str, mention=mention_str
+                        )
+                        logger.info(f"{summoner_name} ranked UP: {old_rank_str} → {new_rank_str}")
+                    else:
+                        rank_demoted = True
+                        rank_embed = DiscordHandler.create_rank_down_embed(
+                            f"{summoner_name}#{tag}", old_rank_str, new_rank_str, mention=mention_str
+                        )
+                        logger.info(f"{summoner_name} ranked DOWN: {old_rank_str} → {new_rank_str}")
+                    await channel.send(embed=rank_embed)
+        else:
+            tier = old_tier or "Unranked"
+            rank = old_rank or ""
+            lp = old_lp
+            logger.debug(f"No solo queue data for {summoner_name}, still checking recent matches")
+
+        recent_matches = await asyncio.to_thread(riot.get_recent_matches, puuid, 0, 10)
         if not recent_matches:
             logger.debug(f"No recent matches for {summoner_name}")
             return
@@ -338,7 +337,7 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
             kda = (kills + assists) / max(deaths, 1)
             pentakills = player_match.get("pentaKills", 0)
 
-            if is_latest and old_lp is not None and last_seen_id is not None and not rank_promoted and not rank_demoted:
+            if is_latest and lp is not None and old_lp is not None and last_seen_id is not None and not rank_promoted and not rank_demoted:
                 lp_change = lp - old_lp
             else:
                 lp_change = None

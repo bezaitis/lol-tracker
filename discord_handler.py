@@ -38,23 +38,8 @@ class DiscordHandler:
         secs = seconds % 60
         return f"{minutes}:{secs:02d}"
     
-    @staticmethod
-    def get_kda_color(kda: float, win: bool) -> int:
-        """Determine embed color based on KDA and win."""
-        if win:
-            if kda > 5:
-                return 0x00FF00  # Bright green
-            elif kda > 3:
-                return 0x90EE90  # Light green
-            else:
-                return 0x4169E1  # Royal blue
-        else:
-            if kda < 1:
-                return 0xFF0000  # Red
-            elif kda < 2:
-                return 0xFF6347  # Tomato
-            else:
-                return 0xFFD700  # Gold
+    WIN_COLOR = 0x57F287   # Green
+    LOSS_COLOR = 0xED4245  # Red
     
     @staticmethod
     def create_match_embed(player_name: str, match_data: Dict[str, Any]) -> discord.Embed:
@@ -99,7 +84,7 @@ class DiscordHandler:
         # Title and color
         result_emoji = DiscordHandler.EMOJIS["win"] if win else DiscordHandler.EMOJIS["loss"]
         result_text = "VICTORY" if win else "DEFEAT"
-        color = DiscordHandler.get_kda_color(kda, win)
+        color = DiscordHandler.WIN_COLOR if win else DiscordHandler.LOSS_COLOR
 
         embed_ts = (
             datetime.fromtimestamp(game_end_ts, tz=timezone.utc)
@@ -155,8 +140,9 @@ class DiscordHandler:
             elif lp_change is None:
                 lp_value = f"**{new_lp} LP**"
             else:
-                prefix = "+" if lp_change >= 0 else ""
-                lp_value = f"{prefix}{lp_change} LP → **{new_lp} LP**"
+                before_lp = new_lp - lp_change
+                sign = "+" if lp_change >= 0 else ""
+                lp_value = f"{before_lp} LP  →  {sign}{lp_change}  →  **{new_lp} LP**"
 
             embed.add_field(
                 name="LP",
@@ -192,23 +178,11 @@ class DiscordHandler:
                 inline=True
             )
 
-        # Performance analysis — pentakill takes priority over everything else
+        # Pentakill callout
         if pentakills > 0:
             embed.add_field(
                 name="🎆 PENTAKILL 🎆",
                 value=f"**{'🎆 ' * pentakills}PENTAKILL{'S' if pentakills > 1 else ''}!**",
-                inline=False
-            )
-        elif deaths >= 5 and kills + assists < 5:
-            embed.add_field(
-                name="Analysis",
-                value=f"{inting_emoji} Looking a bit rough there chief",
-                inline=False
-            )
-        elif kda > 5 and win:
-            embed.add_field(
-                name="Analysis",
-                value="🎯 Absolutely popped off!",
                 inline=False
             )
 
