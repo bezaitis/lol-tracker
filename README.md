@@ -95,6 +95,19 @@ sudo systemctl restart lol-tracker
 sudo systemctl status lol-tracker
 ```
 
+### One-time step for the roster-migration deploy
+
+The commit that moved the roster into SQLite also removed `config.json` from the repo. The server's copy has local edits (the old bot wrote to it), so the first pull needs the file preserved manually — the new code reads it once to seed the roster table:
+
+```bash
+cd /opt/lol-tracker
+cp config.json /tmp/config.json    # back up the live roster
+git checkout -- config.json        # discard local edits so the pull can proceed
+git pull                           # this deletes config.json (removed from repo)
+cp /tmp/config.json config.json    # restore — now untracked & gitignored
+sudo systemctl restart lol-tracker # first boot imports config.json into the roster table
+```
+
 ## Server Management
 
 ```bash
@@ -120,9 +133,19 @@ python main.py
 
 ## Adding / Removing Players
 
-Use the Discord slash commands directly — no need to edit `config.json` by hand:
-- `/add PlayerName NA1 @DiscordUser` — adds player and links their Discord for pings
-- `/remove @DiscordUser` or `/remove PlayerName NA1` — removes player
+The roster lives in the SQLite database (`data.db`), managed entirely through slash commands:
+- `/add PlayerName NA1 @DiscordUser` — validates the Riot ID against the Riot API, then adds the player and links their Discord for pings
+- `/remove @DiscordUser` or `/remove PlayerName NA1` — deactivates the player (match history is preserved)
+
+On first startup, if the roster table is empty and a `config.json` is present, the bot imports its players automatically (one-time migration). New installs can copy `config.example.json` to `config.json` to seed an initial roster, or just use `/add`.
+
+## Rank Crest Emojis (optional)
+
+The bot looks for guild emojis named `rank_iron`, `rank_bronze`, `rank_silver`, `rank_gold`, `rank_platinum`, `rank_emerald`, `rank_diamond`, `rank_master`, `rank_grandmaster`, `rank_challenger` and uses them in `/rank` and `/leaderboard`. Upload them once in **Server Settings → Emoji**; if missing, the bot falls back to colored circle emojis.
+
+## Weekly Recap
+
+Every Sunday at 17:00 UTC the bot posts a recap: per player — games, W/L, net LP, longest win streak, and best-KDA game of the week.
 
 ## File Structure
 
@@ -131,9 +154,11 @@ lol-tracker/
 ├── main.py              # Bot core, slash commands, match-check loop
 ├── riot_client.py       # Riot API wrapper (rate limiting, caching)
 ├── discord_handler.py   # Discord embed formatting
-├── database.py          # SQLite operations
-├── config.json          # Tracked players list
+├── database.py          # SQLite operations (incl. roster table)
+├── config.example.json  # Sample roster seed (copy to config.json, optional)
+├── tests/               # pytest suite
 ├── requirements.txt
+├── requirements-dev.txt # pytest (CI / local testing)
 ├── .env                 # Secrets — never commit
 ├── .env.example
 ├── .gitignore
@@ -145,7 +170,7 @@ lol-tracker/
 
 **Bot not posting matches**
 1. `tail -f /opt/lol-tracker/bot.log` — check for errors
-2. Verify `config.json` summoner names and tags are correct
+2. Run `/players` to verify the roster; `/add` validates names against the Riot API
 3. Confirm the bot has send-message permission in the Discord channel
 
 **Rate limit errors**

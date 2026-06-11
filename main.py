@@ -5,26 +5,34 @@ import os
 import json
 import io
 import logging
+from logging.handlers import RotatingFileHandler
 import asyncio
-import sqlite3
 import time
 import colorsys
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timezone
 from dotenv import load_dotenv
 
 from riot_client import RiotClient
 from database import Database
 from discord_handler import DiscordHandler
 
-# Load environment variables
 load_dotenv()
 
-# Tier ordering for rank comparison (higher index = higher rank)
+# Tier ordering (higher index = better rank)
 TIER_ORDER = [
     "IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM",
-    "EMERALD", "DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER"
+    "EMERALD", "DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER",
 ]
 DIVISION_ORDER = ["IV", "III", "II", "I"]
+
+# LP scale helpers used by /graph (module-level for testability)
+_DIV_OFFSET = {"IV": 0, "III": 100, "II": 200, "I": 300}
+_POOLED_TIERS = {"MASTER", "GRANDMASTER", "CHALLENGER"}
+_TIER_ABBREV = {
+    "IRON": "Irn", "BRONZE": "Brz", "SILVER": "Slv", "GOLD": "Gld",
+    "PLATINUM": "Plt", "EMERALD": "Emr", "DIAMOND": "Dia",
+    "MASTER": "Master", "GRANDMASTER": "GM", "CHALLENGER": "Chall",
+}
 
 def rank_value(tier: str, division: str) -> int:
     """Convert tier + division to a comparable integer. Higher = better rank."""
@@ -32,97 +40,153 @@ def rank_value(tier: str, division: str) -> int:
     div_idx = DIVISION_ORDER.index(division.upper()) if division.upper() in DIVISION_ORDER else 0
     return tier_idx * 4 + div_idx
 
-# Logging configuration
+def to_abs_lp(tier: str, division: str, lp: int) -> int:
+    t = (tier or "IRON").upper()
+    t_idx = TIER_ORDER.index(t) if t in TIER_ORDER else 0
+    if t in _POOLED_TIERS:
+        return t_idx * 400 + lp
+    return t_idx * 400 + _DIV_OFFSET.get((division or "IV").upper(), 0) + lp
+
+def abs_to_label(abs_lp: int) -> str:
+    t_idx = abs_lp // 400
+    if t_idx >= len(TIER_ORDER):
+        return ""
+    t = TIER_ORDER[t_idx]
+    abbrev = _TIER_ABBREV.get(t, t.title())
+    if t in _POOLED_TIERS:
+        lp_within = abs_lp % 400
+        return f"{abbrev} {lp_within}LP" if lp_within else abbrev
+    div = ["IV", "III", "II", "I"][(abs_lp % 400) // 100]
+    return f"{abbrev} {div}"
+
+# Logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler()
-    ]
+        RotatingFileHandler("bot.log", maxBytes=5_000_000, backupCount=3),
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger(__name__)
 
-# Bot setup — no prefix since we're using slash commands exclusively
-intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="\x00", intents=intents)  # null prefix = disabled
-
-# Clients
-riot = None
-db = None
+# Global state — populated in setup_hook / on_ready
+riot: RiotClient = None
+db: Database = None
 channel = None
-inting_emoji_str = "💀"  # fallback if guild emoji not found
+ddragon_patch: str = "15.1.1"
+inting_emoji_str: str = "💀"
+rank_emoji_strs: dict = {k: v for k, v in DiscordHandler.RANK_EMOJIS.items()}
+
+
+def format_rank_line(tier: str, division: str, lp: int,
+                     win_streak: int = 0, loss_streak: int = 0) -> tuple:
+    """Returns (rank_str, streak_str) using resolved guild rank emojis."""
+    tier_upper = (tier or "UNRANKED").upper()
+    tier_emoji = rank_emoji_strs.get(tier_upper, "❓")
+
+    if tier_upper in _POOLED_TIERS:
+        rank_str = f"{tier_emoji} {tier.title()} — {lp} LP"
+    elif tier_upper == "UNRANKED":
+        rank_str = "Unranked"
+    else:
+        rank_str = f"{tier_emoji} {tier.title()} {division} — {lp} LP"
+
+    streak_str = ""
+    if win_streak > 1:
+        streak_str = f" 🔥 {win_streak}W streak"
+    elif loss_streak > 1:
+        streak_str = f" 💀 {loss_streak}L streak"
+
+    return rank_str, streak_str
+
+
+# Bot
+
+intents = discord.Intents.default()
+
+class LoLBot(commands.Bot):
+    async def setup_hook(self):
+        """One-time initialization before the gateway connects."""
+        global riot, db, ddragon_patch
+
+        riot = RiotClient(os.getenv("RIOT_API_KEY"))
+        db = Database("data.db")
+
+        ddragon_patch = await asyncio.to_thread(riot.get_ddragon_patch)
+        logger.info(f"Data Dragon patch: {ddragon_patch}")
+
+        try:
+            synced = await self.tree.sync()
+            logger.info(f"Synced {len(synced)} slash command(s)")
+        except Exception as e:
+            logger.error(f"Failed to sync slash commands: {e}")
+
+        # Re-attach persistent clash views so buttons survive restarts
+        for clash_event in db.get_all_active_clash_events():
+            view = ClashSignupView(clash_event["tournament_id"])
+            self.add_view(view, message_id=int(clash_event["message_id"]))
+
+        check_matches.start()
+        check_clash_reminders.start()
+        weekly_recap.start()
+        logger.info("setup_hook complete")
+
+
+bot = LoLBot(command_prefix="\x00", intents=intents)
+
 
 @bot.event
 async def on_ready():
-    """Bot startup"""
-    global riot, db, channel, inting_emoji_str
+    """Runs on each gateway connect/reconnect. Resolve guild-specific resources."""
+    global channel, inting_emoji_str, rank_emoji_strs
 
     logger.info(f"Logged in as {bot.user}")
 
-    # Initialize clients
-    riot = RiotClient(os.getenv("RIOT_API_KEY"))
-    db = Database("data.db")
-
-    # Get Discord channel
     channel_id = int(os.getenv("DISCORD_CHANNEL_ID"))
     channel = bot.get_channel(channel_id)
-
     if not channel:
         logger.error(f"Could not find Discord channel {channel_id}")
         return
-
     logger.info(f"Connected to channel: {channel.name}")
 
-    # Resolve custom :inting: guild emoji so embeds render it properly
     inting_emoji = discord.utils.get(bot.emojis, name="inting")
     if inting_emoji:
         inting_emoji_str = str(inting_emoji)
         logger.info(f"Resolved :inting: emoji: {inting_emoji_str}")
     else:
+        inting_emoji_str = "💀"
         logger.warning("Could not find :inting: emoji in guild — using 💀 fallback")
 
-    # Register slash commands
-    try:
-        synced = await bot.tree.sync()
-        logger.info(f"Synced {len(synced)} slash command(s)")
-    except Exception as e:
-        logger.error(f"Failed to sync slash commands: {e}")
+    _RANK_EMOJI_NAMES = {
+        "IRON": "rank_iron", "BRONZE": "rank_bronze", "SILVER": "rank_silver",
+        "GOLD": "rank_gold", "PLATINUM": "rank_platinum", "EMERALD": "rank_emerald",
+        "DIAMOND": "rank_diamond", "MASTER": "rank_master",
+        "GRANDMASTER": "rank_grandmaster", "CHALLENGER": "rank_challenger",
+    }
+    for tier, emoji_name in _RANK_EMOJI_NAMES.items():
+        emoji = discord.utils.get(bot.emojis, name=emoji_name)
+        rank_emoji_strs[tier] = str(emoji) if emoji else DiscordHandler.RANK_EMOJIS.get(tier, "❓")
 
-    # Start the tracking loop
-    if not check_matches.is_running():
-        check_matches.start()
-        logger.info("Match tracking loop started")
 
-    if not check_clash_reminders.is_running():
-        check_clash_reminders.start()
-        logger.info("Clash reminder loop started")
-
-    # Re-attach persistent clash views so buttons work after a restart
-    for clash_event in db.get_all_active_clash_events():
-        view = ClashSignupView(clash_event["tournament_id"])
-        bot.add_view(view, message_id=int(clash_event["message_id"]))
+# ---------------------------------------------------------------------------
+# Background tasks
+# ---------------------------------------------------------------------------
 
 class ClashSignupView(discord.ui.View):
-    """Persistent Sign Up / Remove buttons attached to each clash embed."""
-
     def __init__(self, tournament_id: str):
         super().__init__(timeout=None)
         self.tournament_id = tournament_id
 
         btn_signup = discord.ui.Button(
-            label="Sign Up",
-            style=discord.ButtonStyle.success,
-            emoji="✅",
+            label="Sign Up", style=discord.ButtonStyle.success, emoji="✅",
             custom_id=f"clash_signup_{tournament_id}",
         )
         btn_signup.callback = self._signup
         self.add_item(btn_signup)
 
         btn_remove = discord.ui.Button(
-            label="Remove",
-            style=discord.ButtonStyle.danger,
-            emoji="❌",
+            label="Remove", style=discord.ButtonStyle.danger, emoji="❌",
             custom_id=f"clash_remove_{tournament_id}",
         )
         btn_remove.callback = self._remove
@@ -146,22 +210,29 @@ class ClashSignupView(discord.ui.View):
 
 @tasks.loop(minutes=1)
 async def check_matches():
-    """Main loop - check all players every 60 seconds"""
+    """Main loop — check all roster players every 60 seconds."""
     try:
-        with open("config.json", "r") as f:
-            config = json.load(f)
+        if not db or not channel:
+            return
 
-        players = config.get("players", [])
+        players = db.get_roster(active_only=True)
+
+        # Build puuid→player map for active roster (used for duo detection)
+        all_db_players = {p["puuid"]: p for p in db.get_all_players()}
+        roster_set = {(r["summoner_name"].lower(), r["tag"].lower()) for r in players}
+        tracked_puuids = {
+            puuid: p
+            for puuid, p in all_db_players.items()
+            if (p["summoner_name"].lower(), p["tag"].lower()) in roster_set
+        }
 
         for player_config in players:
             summoner_name = player_config.get("summoner_name")
             tag = player_config.get("tag", "NA1")
-
             if not summoner_name:
                 continue
-
             try:
-                await check_player_matches(summoner_name, tag, player_config)
+                await check_player_matches(summoner_name, tag, player_config, tracked_puuids)
             except Exception as e:
                 logger.error(f"Error checking {summoner_name}: {e}")
             await asyncio.sleep(1)
@@ -169,9 +240,10 @@ async def check_matches():
     except Exception as e:
         logger.error(f"Error in check_matches loop: {e}")
 
+
 @tasks.loop(minutes=30)
 async def check_clash_reminders():
-    """Ping the first 5 signed-up players for any Clash starting within 48 h."""
+    """Ping the first 5 signed-up players for any Clash starting within 48h."""
     if not db or not channel:
         return
     for event in db.get_unreminded_clash_events():
@@ -194,10 +266,25 @@ async def check_clash_reminders():
         db.mark_clash_reminded(event["tournament_id"])
 
 
-async def check_player_matches(summoner_name: str, tag: str = "NA1", player_config: dict = None):
-    """Check a single player for new matches, processing up to 3 missed games in order."""
-    global riot, db, channel, inting_emoji_str
+@tasks.loop(time=dtime(hour=17, minute=0, second=0))
+async def weekly_recap():
+    """Post a weekly summary every Sunday at ~1pm EDT (17:00 UTC)."""
+    if not db or not channel:
+        return
+    if datetime.now(tz=timezone.utc).weekday() != 6:  # 6 = Sunday
+        return
+    weekly_data = db.get_weekly_summary()
+    if not weekly_data:
+        return
+    embed = DiscordHandler.create_recap_embed(weekly_data)
+    await channel.send(embed=embed)
+    logger.info("Posted weekly recap")
 
+
+async def check_player_matches(summoner_name: str, tag: str = "NA1",
+                                player_config: dict = None,
+                                tracked_puuids: dict = None):
+    """Check a single player for new matches, processing up to 10 missed games in order."""
     if not riot or not db or not channel:
         return
 
@@ -213,7 +300,6 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
             return
 
         puuid = summoner.get("puuid")
-
         db.add_or_update_player(puuid, summoner_name, tag)
 
         player_data = db.get_player(puuid)
@@ -235,10 +321,8 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
             tier = solo_queue.get("tier", "Unranked")
             rank = solo_queue.get("rank", "")
             lp = solo_queue.get("leaguePoints", 0)
-
             db.update_player_rank(puuid, tier, rank, lp)
 
-            # Detect rank changes and send a dedicated embed
             if old_tier and old_tier != "Unranked" and (old_tier != tier or (old_rank and old_rank != rank)):
                 old_val = rank_value(old_tier, old_rank or "I")
                 new_val = rank_value(tier, rank or "I")
@@ -264,7 +348,7 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
             tier = old_tier or "Unranked"
             rank = old_rank or ""
             lp = old_lp
-            logger.debug(f"No solo queue data for {summoner_name}, still checking recent matches")
+            logger.debug(f"No solo queue data for {summoner_name}")
 
         recent_matches = await asyncio.to_thread(riot.get_recent_matches, puuid, 0, 10)
         if not recent_matches:
@@ -310,39 +394,54 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
                 logger.info(f"{summoner_name} — skipping non-ranked match {match_id} (queueId={queue_id})")
                 continue
 
-            win = player_match.get("win", False)
-            champion = player_match.get("championName", "Unknown")
-            kills = player_match.get("kills", 0)
-            deaths = player_match.get("deaths", 0)
-            assists = player_match.get("assists", 0)
             game_duration = info.get("gameDuration", 0)
-
-            # Remakes: early surrender vote before 3 min — don't count as win/loss
-            if player_match.get("gameEndedInEarlySurrender", False) and game_duration < 180:
-                db.update_last_match_id(puuid, match_id)
-                logger.info(f"{summoner_name} — remake {match_id} (duration={game_duration}s)")
-                await channel.send(f"🔄 **{summoner_name}#{tag}** — remake on {champion} (game ended in {int(game_duration)}s)")
-                continue
 
             game_end_ts_ms = info.get("gameEndTimestamp") or (
                 info.get("gameCreation", 0) + game_duration * 1000
             )
             game_end_ts = game_end_ts_ms / 1000
 
+            # A2: skip old matches before checking for remakes so newly added players
+            # don't get stale remake announcements
             if time.time() - game_end_ts > ONE_DAY:
                 db.update_last_match_id(puuid, match_id)
                 logger.info(f"{summoner_name} — skipping old match {match_id}")
                 continue
 
+            win = player_match.get("win", False)
+            champion = player_match.get("championName", "Unknown")
+            kills = player_match.get("kills", 0)
+            deaths = player_match.get("deaths", 0)
+            assists = player_match.get("assists", 0)
+
+            # Remakes: early surrender before 3 min
+            if player_match.get("gameEndedInEarlySurrender", False) and game_duration < 180:
+                db.update_last_match_id(puuid, match_id)
+                logger.info(f"{summoner_name} — remake {match_id} (duration={game_duration}s)")
+                await channel.send(
+                    f"🔄 **{summoner_name}#{tag}** — remake on {champion} (game ended in {int(game_duration)}s)"
+                )
+                continue
+
             kda = (kills + assists) / max(deaths, 1)
+
             pentakills = player_match.get("pentaKills", 0)
+            quadrakills = player_match.get("quadraKills", 0)
+            triplekills = player_match.get("tripleKills", 0)
+            if pentakills > 0:
+                multikill = "Penta"
+            elif quadrakills > 0:
+                multikill = "Quadra"
+            elif triplekills > 0:
+                multikill = "Triple"
+            else:
+                multikill = None
 
             if is_latest and lp is not None and old_lp is not None and last_seen_id is not None and not rank_promoted and not rank_demoted:
                 lp_change = lp - old_lp
             else:
                 lp_change = None
 
-            # Gold differential vs lane opponent
             gold_diff = None
             player_position = player_match.get("teamPosition", "")
             player_gold = player_match.get("goldEarned", 0)
@@ -354,41 +453,48 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
                         gold_diff = player_gold - participant.get("goldEarned", 0)
                         break
 
-            # CS/min and position
             total_cs = player_match.get("totalMinionsKilled", 0) + player_match.get("neutralMinionsKilled", 0)
             duration_min = game_duration / 60 if game_duration > 0 else 1
             cs_per_min = round(total_cs / duration_min, 1)
 
             position_map = {
                 "TOP": "Top", "JUNGLE": "Jungle", "MIDDLE": "Mid",
-                "BOTTOM": "Bot", "UTILITY": "Support"
+                "BOTTOM": "Bot", "UTILITY": "Support",
             }
             position = position_map.get(player_match.get("teamPosition", ""), None)
 
-            db.update_streaks(puuid, win)
+            # Duo detection — other active tracked players in the same game who also won
+            duo_with = []
+            if tracked_puuids and win:
+                participant_puuids = {p["puuid"] for p in info.get("participants", [])}
+                for other_puuid, other_player in tracked_puuids.items():
+                    if other_puuid == puuid:
+                        continue
+                    if other_puuid in participant_puuids:
+                        for part in info.get("participants", []):
+                            if part["puuid"] == other_puuid and part.get("win") is True:
+                                duo_with.append(other_player["summoner_name"])
+                                break
 
+            db.update_streaks(puuid, win)
             updated_player = db.get_player(puuid) or {}
             win_streak = updated_player.get("win_streak", 0)
             loss_streak = updated_player.get("loss_streak", 0)
 
             is_new_match = db.add_match(
-                match_id=match_id,
-                puuid=puuid,
-                win=win,
-                champion=champion,
-                kills=kills,
-                deaths=deaths,
-                assists=assists,
-                lp_change=lp_change,
-                new_lp=lp,
-                game_duration=game_duration,
-                pentakills=pentakills,
-                position=position
+                match_id=match_id, puuid=puuid, win=win, champion=champion,
+                kills=kills, deaths=deaths, assists=assists,
+                lp_change=lp_change, new_lp=lp, game_duration=game_duration,
+                pentakills=pentakills, position=position,
             )
 
             if not is_new_match:
-                logger.warning(f"Match {match_id} already recorded for {summoner_name} — skipping Discord post")
+                logger.warning(f"Match {match_id} already recorded for {summoner_name} — skipping post")
                 continue
+
+            champion_thumbnail_url = (
+                f"https://ddragon.leagueoflegends.com/cdn/{ddragon_patch}/img/champion/{champion}.png"
+            )
 
             match_info = {
                 "win": win,
@@ -406,20 +512,25 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
                 "promoted": is_latest and rank_promoted,
                 "demoted": is_latest and rank_demoted,
                 "gold_diff": gold_diff,
-                "inting_emoji": inting_emoji_str,
                 "pentakills": pentakills,
                 "cs_per_min": cs_per_min,
                 "position": position,
+                "multikill": multikill,
+                "champion_thumbnail_url": champion_thumbnail_url,
+                "duo_with": duo_with,
             }
 
             embed = DiscordHandler.create_match_embed(f"{summoner_name}#{tag}", match_info)
-            await channel.send(embed=embed)
-            # Only ping on the latest match in a batch to avoid spam
+
+            # B1: fold ping into the same message to avoid double-posting
+            ping_content = None
             if discord_id and is_latest:
                 if win:
-                    await channel.send(f"<@{discord_id}> is gapping! 🤯")
+                    ping_content = f"<@{discord_id}> is gapping! 🤯"
                 else:
-                    await channel.send(f"<@{discord_id}> is inting! {inting_emoji_str}")
+                    ping_content = f"<@{discord_id}> is inting! {inting_emoji_str}"
+
+            await channel.send(content=ping_content, embed=embed)
             logger.info(f"Posted match {match_id} for {summoner_name}: {'WIN' if win else 'LOSS'}")
 
     except Exception as e:
@@ -434,7 +545,6 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1", player_conf
 def _build_clash_embed(name: str, schedule: list, signups: list) -> discord.Embed:
     embed = discord.Embed(title=f"🏆 Clash: {name}", color=0xE8A838)
 
-    # Schedule: one field per non-cancelled phase
     active = [p for p in schedule if not p.get("cancelled")]
     sched_lines = []
     for i, phase in enumerate(active, 1):
@@ -450,7 +560,6 @@ def _build_clash_embed(name: str, schedule: list, signups: list) -> discord.Embe
         inline=False,
     )
 
-    # Signups: first 5 = team, rest = standby
     if signups:
         lines = []
         for i, s in enumerate(signups):
@@ -464,9 +573,22 @@ def _build_clash_embed(name: str, schedule: list, signups: list) -> discord.Embe
         value=signup_text,
         inline=False,
     )
-
     embed.set_footer(text="First 5 to sign up will be pinged before the tournament · Standby players listed after")
     return embed
+
+
+# ---------------------------------------------------------------------------
+# Helper: build active-roster filter set
+# ---------------------------------------------------------------------------
+
+def _active_roster_set() -> set:
+    """Return {(lower_name, lower_tag)} for all active roster entries."""
+    return {(r["summoner_name"].lower(), r["tag"].lower()) for r in db.get_roster(active_only=True)}
+
+
+def _filter_to_roster(all_players: list) -> list:
+    active = _active_roster_set()
+    return [p for p in all_players if (p["summoner_name"].lower(), p["tag"].lower()) in active]
 
 
 # ---------------------------------------------------------------------------
@@ -480,16 +602,23 @@ async def ping(interaction: discord.Interaction):
 
 @bot.tree.command(name="players", description="List all tracked players")
 async def players(interaction: discord.Interaction):
-    with open("config.json", "r") as f:
-        config = json.load(f)
-
-    player_list_cfg = config.get("players", [])
-    if not player_list_cfg:
-        await interaction.response.send_message("No players configured!")
+    if not db:
+        await interaction.response.send_message("Bot is still starting up, try again in a moment.", ephemeral=True)
         return
 
-    lines = "\n".join([f"• {p['summoner_name']}#{p.get('tag', 'NA1')}" for p in player_list_cfg])
-    embed = discord.Embed(title="Tracked Players", description=lines, color=0x5865F2)
+    roster = db.get_roster(active_only=True)
+    if not roster:
+        await interaction.response.send_message("No players in the roster.", ephemeral=True)
+        return
+
+    lines = []
+    for r in roster:
+        line = f"• **{r['summoner_name']}#{r['tag']}**"
+        if r.get("discord_id"):
+            line += f" — <@{r['discord_id']}>"
+        lines.append(line)
+
+    embed = discord.Embed(title="Tracked Players", description="\n".join(lines), color=0x5865F2)
     await interaction.response.send_message(embed=embed)
 
 
@@ -497,193 +626,129 @@ async def players(interaction: discord.Interaction):
 @app_commands.describe(summoner="Player name#tag (e.g. bez#7979)")
 async def rank(interaction: discord.Interaction, summoner: str = None):
     if not db:
-        await interaction.response.send_message("Bot is still starting up, try again in a moment.")
+        await interaction.response.send_message("Bot is still starting up, try again in a moment.", ephemeral=True)
         return
 
-    all_players = db.get_all_players()
+    all_players = _filter_to_roster(db.get_all_players())
     if not all_players:
-        await interaction.response.send_message("No player data yet — the bot may still be initializing.")
+        await interaction.response.send_message("No player data yet — the bot may still be initializing.", ephemeral=True)
         return
 
     if summoner:
         if "#" not in summoner:
-            await interaction.response.send_message("Use the format `name#tag` (e.g. `bez#7979`).")
+            await interaction.response.send_message("Use the format `name#tag` (e.g. `bez#7979`).", ephemeral=True)
             return
         target_name, target_tag = summoner.split("#", 1)
         all_players = [
             p for p in all_players
-            if p.get("summoner_name", "").lower() == target_name.lower()
-            and p.get("tag", "").lower() == target_tag.lower()
+            if p["summoner_name"].lower() == target_name.lower()
+            and p["tag"].lower() == target_tag.lower()
         ]
         if not all_players:
-            await interaction.response.send_message(f"No data for **{summoner}**.")
+            await interaction.response.send_message(f"No data for **{summoner}**.", ephemeral=True)
             return
 
     embed = discord.Embed(title="📊 Current Ranks", color=0x5865F2)
-
     for p in all_players:
         name = p.get("summoner_name", "Unknown")
         tag = p.get("tag", "NA1")
-        tier = p.get("current_tier", "Unranked")
-        division = p.get("current_rank", "")
-        lp = p.get("current_lp", 0)
-        win_streak = p.get("win_streak", 0)
-        loss_streak = p.get("loss_streak", 0)
-
-        tier_upper = tier.upper() if tier else "UNRANKED"
-        tier_emoji = DiscordHandler.RANK_EMOJIS.get(tier_upper, "❓")
-
-        if tier_upper in ("MASTER", "GRANDMASTER", "CHALLENGER"):
-            rank_str = f"{tier_emoji} {tier.title()} — {lp} LP"
-        elif tier_upper == "UNRANKED":
-            rank_str = "Unranked"
-        else:
-            rank_str = f"{tier_emoji} {tier.title()} {division} — {lp} LP"
-
-        streak_str = ""
-        if win_streak > 1:
-            streak_str = f" 🔥 {win_streak}W streak"
-        elif loss_streak > 1:
-            streak_str = f" 💀 {loss_streak}L streak"
-
+        rank_str, streak_str = format_rank_line(
+            p.get("current_tier", "Unranked"),
+            p.get("current_rank", ""),
+            p.get("current_lp", 0),
+            p.get("win_streak", 0),
+            p.get("loss_streak", 0),
+        )
         opgg_url = f"https://op.gg/lol/summoners/na/{name}-{tag}"
         embed.add_field(
             name=f"{name}#{tag}",
             value=f"[{rank_str}{streak_str}]({opgg_url})",
-            inline=False
+            inline=False,
         )
-
     await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="stats", description="Show win rate and KDA. Leave blank for all players.")
 @app_commands.describe(
     member="Discord member (ping them)",
-    summoner="Or provide name#tag directly"
+    summoner="Or provide name#tag directly",
 )
 async def stats(interaction: discord.Interaction, member: discord.Member = None, summoner: str = None):
     if not db:
-        await interaction.response.send_message("Bot is still starting up, try again in a moment.")
+        await interaction.response.send_message("Bot is still starting up, try again in a moment.", ephemeral=True)
         return
 
-    await interaction.response.defer()
-
-    all_players = db.get_all_players()
+    all_players = _filter_to_roster(db.get_all_players())
     if not all_players:
-        await interaction.followup.send("No player data yet — the bot may still be initializing.")
+        await interaction.response.send_message("No player data yet — the bot may still be initializing.", ephemeral=True)
         return
 
     if member:
-        with open("config.json") as f:
-            config = json.load(f)
-        target = next(
-            (p for p in config.get("players", []) if str(p.get("discord_id", "")) == str(member.id)),
-            None
-        )
+        roster = db.get_roster()
+        target = next((r for r in roster if str(r.get("discord_id", "")) == str(member.id)), None)
         if not target:
-            await interaction.followup.send(f"No summoner linked to {member.mention}. Add their `discord_id` to config.json.")
+            await interaction.response.send_message(
+                f"No summoner linked to {member.mention}. Use `/add` to link them.", ephemeral=True
+            )
             return
         all_players = [
             p for p in all_players
-            if p.get("summoner_name", "").lower() == target["summoner_name"].lower()
-            and p.get("tag", "").lower() == target.get("tag", "").lower()
+            if p["summoner_name"].lower() == target["summoner_name"].lower()
+            and p["tag"].lower() == target["tag"].lower()
         ]
         if not all_players:
-            await interaction.followup.send(f"No tracked data for **{target['summoner_name']}#{target.get('tag', '')}** yet.")
+            await interaction.response.send_message(
+                f"No tracked data for **{target['summoner_name']}#{target['tag']}** yet.", ephemeral=True
+            )
             return
     elif summoner:
         if "#" not in summoner:
-            await interaction.followup.send("Use the format `name#tag` (e.g. `bez#7979`).")
+            await interaction.response.send_message("Use the format `name#tag` (e.g. `bez#7979`).", ephemeral=True)
             return
         target_name, target_tag = summoner.split("#", 1)
         all_players = [
             p for p in all_players
-            if p.get("summoner_name", "").lower() == target_name.lower()
-            and p.get("tag", "").lower() == target_tag.lower()
+            if p["summoner_name"].lower() == target_name.lower()
+            and p["tag"].lower() == target_tag.lower()
         ]
         if not all_players:
-            await interaction.followup.send(f"No data for **{summoner}**.")
+            await interaction.response.send_message(f"No data for **{summoner}**.", ephemeral=True)
             return
 
+    # All validation passed — defer publicly for the aggregate queries
+    await interaction.response.defer()
+
     embed = discord.Embed(title="📈 Player Stats", color=0x5865F2)
+    for p in all_players:
+        puuid = p.get("puuid")
+        name = p.get("summoner_name", "Unknown")
+        tag = p.get("tag", "NA1")
 
-    with sqlite3.connect(db.db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
+        s = db.get_player_stats(puuid)
+        if s is None:
+            embed.add_field(name=f"{name}#{tag}", value="No tracked games yet.", inline=False)
+            continue
 
-        for p in all_players:
-            puuid = p.get("puuid")
-            name = p.get("summoner_name", "Unknown")
-            tag = p.get("tag", "NA1")
-
-            cursor.execute("""
-                SELECT
-                    COUNT(*) as total,
-                    SUM(CASE WHEN win THEN 1 ELSE 0 END) as wins,
-                    AVG(kda) as avg_kda,
-                    AVG(kills) as avg_kills,
-                    AVG(deaths) as avg_deaths,
-                    AVG(assists) as avg_assists,
-                    SUM(pentakills) as total_pentas
-                FROM matches WHERE puuid = ?
-            """, (puuid,))
-            row = cursor.fetchone()
-
-            total = row["total"] or 0
-            wins = row["wins"] or 0
-            losses = total - wins
-            avg_kda = row["avg_kda"] or 0
-            avg_k = row["avg_kills"] or 0
-            avg_d = row["avg_deaths"] or 0
-            avg_a = row["avg_assists"] or 0
-            total_pentas = row["total_pentas"] or 0
-
-            if total == 0:
-                embed.add_field(name=f"{name}#{tag}", value="No tracked games yet.", inline=False)
-                continue
-
-            wr = (wins / total) * 100
-            wr_emoji = "🟢" if wr >= 55 else "🟡" if wr >= 45 else "🔴"
-
-            # Favorite champion (most played overall)
-            cursor.execute("""
-                SELECT champion, COUNT(*) as cnt FROM matches
-                WHERE puuid = ? GROUP BY champion ORDER BY cnt DESC LIMIT 1
-            """, (puuid,))
-            fav_champ_row = cursor.fetchone()
-            fav_champ = fav_champ_row["champion"] if fav_champ_row else "N/A"
-
-            # Favorite role: most common position when playing their most-played champion
-            cursor.execute("""
-                SELECT position, COUNT(*) as cnt FROM matches
-                WHERE puuid = ? AND champion = ? AND position IS NOT NULL AND position != ''
-                GROUP BY position ORDER BY cnt DESC LIMIT 1
-            """, (puuid, fav_champ))
-            fav_role_row = cursor.fetchone()
-            fav_role = fav_role_row["position"] if fav_role_row else None
-
-            # Last 10 matches (no spaces between emojis to keep it compact)
-            cursor.execute("""
-                SELECT win, pentakills FROM matches WHERE puuid = ?
-                ORDER BY timestamp DESC LIMIT 10
-            """, (puuid,))
-            recent = cursor.fetchall()
-            recent_str = "".join(
-                ("🎆" if r["pentakills"] > 0 else "✅") if r["win"] else "❌"
-                for r in recent
-            )
-
-            penta_str = f" · 🎆 **{total_pentas}× Penta**" if total_pentas > 0 else ""
-            fav_line = f"Most played: **{fav_champ}**"
-            if fav_role:
-                fav_line += f" · **{fav_role}**"
-            value = (
-                f"{wr_emoji} **{wr:.1f}% WR** ({wins}W/{losses}L){penta_str}\n"
-                f"Avg KDA: **{avg_k:.1f}/{avg_d:.1f}/{avg_a:.1f}** ({avg_kda:.2f})\n"
-                f"{fav_line}\n"
-                f"Last {len(recent)}: {recent_str}"
-            )
-            embed.add_field(name=f"{name}#{tag}", value=value, inline=False)
+        total = s["total"]
+        wins = s["wins"]
+        losses = total - wins
+        wr = (wins / total) * 100
+        wr_emoji = "🟢" if wr >= 55 else "🟡" if wr >= 45 else "🔴"
+        penta_str = f" · 🎆 **{s['total_pentas']}× Penta**" if s["total_pentas"] > 0 else ""
+        fav_line = f"Most played: **{s['fav_champ']}**"
+        if s["fav_role"]:
+            fav_line += f" · **{s['fav_role']}**"
+        recent_str = "".join(
+            ("🎆" if r["pentakills"] > 0 else "✅") if r["win"] else "❌"
+            for r in s["recent"]
+        )
+        value = (
+            f"{wr_emoji} **{wr:.1f}% WR** ({wins}W/{losses}L){penta_str}\n"
+            f"Avg KDA: **{s['avg_kills']:.1f}/{s['avg_deaths']:.1f}/{s['avg_assists']:.1f}** ({s['avg_kda']:.2f})\n"
+            f"{fav_line}\n"
+            f"Last {len(s['recent'])}: {recent_str}"
+        )
+        embed.add_field(name=f"{name}#{tag}", value=value, inline=False)
 
     await interaction.followup.send(embed=embed)
 
@@ -691,67 +756,55 @@ async def stats(interaction: discord.Interaction, member: discord.Member = None,
 @bot.tree.command(name="history", description="Show last 10 matches for a player")
 @app_commands.describe(
     member="Discord member (ping them)",
-    summoner="Or provide name#tag directly"
+    summoner="Or provide name#tag directly",
 )
 async def history(interaction: discord.Interaction, member: discord.Member = None, summoner: str = None):
     if not db:
-        await interaction.response.send_message("Bot is still starting up, try again in a moment.")
+        await interaction.response.send_message("Bot is still starting up, try again in a moment.", ephemeral=True)
         return
 
-    summoner_name = None
-    summoner_tag = None
+    summoner_name = summoner_tag = None
 
     if member:
-        with open("config.json") as f:
-            config = json.load(f)
-        for p in config.get("players", []):
-            if str(p.get("discord_id", "")) == str(member.id):
-                summoner_name = p["summoner_name"]
-                summoner_tag = p.get("tag", "NA1")
+        roster = db.get_roster()
+        for r in roster:
+            if str(r.get("discord_id", "")) == str(member.id):
+                summoner_name = r["summoner_name"]
+                summoner_tag = r["tag"]
                 break
         if not summoner_name:
             await interaction.response.send_message(
-                f"No summoner linked to {member.mention}. Add their `discord_id` to config.json."
+                f"No summoner linked to {member.mention}. Use `/add` to link them.", ephemeral=True
             )
             return
     elif summoner:
         if "#" not in summoner:
-            await interaction.response.send_message("Use the format `name#tag` (e.g. `bez#7979`).")
+            await interaction.response.send_message("Use the format `name#tag` (e.g. `bez#7979`).", ephemeral=True)
             return
         summoner_name, summoner_tag = summoner.split("#", 1)
     else:
-        await interaction.response.send_message("Provide a @member or a name#tag.")
+        await interaction.response.send_message("Provide a @member or a name#tag.", ephemeral=True)
         return
 
-    all_players = db.get_all_players()
+    all_players = _filter_to_roster(db.get_all_players())
     player = next(
         (p for p in all_players
-         if p.get("summoner_name", "").lower() == summoner_name.lower()
-         and p.get("tag", "").lower() == summoner_tag.lower()),
-        None
+         if p["summoner_name"].lower() == summoner_name.lower()
+         and p["tag"].lower() == summoner_tag.lower()),
+        None,
     )
     if not player:
-        await interaction.response.send_message(f"No data for **{summoner_name}#{summoner_tag}**.")
+        await interaction.response.send_message(f"No data for **{summoner_name}#{summoner_tag}**.", ephemeral=True)
         return
 
-    with sqlite3.connect(db.db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT * FROM matches WHERE puuid = ?
-            ORDER BY timestamp DESC LIMIT 10
-        """, (player["puuid"],))
-        matches = cursor.fetchall()
-
+    matches = db.get_match_history(player["puuid"], limit=10)
     if not matches:
-        await interaction.response.send_message(f"No tracked matches for **{summoner_name}#{summoner_tag}** yet.")
+        await interaction.response.send_message(
+            f"No tracked matches for **{summoner_name}#{summoner_tag}** yet.", ephemeral=True
+        )
         return
 
-    embed = discord.Embed(
-        title=f"📜 Match History — {summoner_name}#{summoner_tag}",
-        color=0x5865F2
-    )
-
+    lines = []
     for m in matches:
         penta = m["pentakills"] > 0
         result = ("🎆" if penta else "✅") if m["win"] else "❌"
@@ -760,71 +813,68 @@ async def history(interaction: discord.Interaction, member: discord.Member = Non
         if m["lp_change"] is not None:
             prefix = "+" if m["lp_change"] >= 0 else ""
             lp_str = f" · {prefix}{m['lp_change']} LP"
-        penta_str = " · 🎆 PENTAKILL" if penta else ""
-        duration = DiscordHandler.format_duration(m["game_duration"])
-        embed.add_field(
-            name=f"{result} {m['champion']} · {kda_str} ({m['kda']:.2f} KDA)",
-            value=f"{duration}{lp_str}{penta_str}",
-            inline=False
-        )
+        ts_str = ""
+        try:
+            ts = datetime.fromisoformat(str(m["timestamp"])).replace(tzinfo=timezone.utc)
+            ts_str = f" · <t:{int(ts.timestamp())}:R>"
+        except Exception:
+            pass
+        lines.append(f"{result} **{m['champion']}** · {kda_str}{lp_str}{ts_str}")
 
+    embed = discord.Embed(
+        title=f"📜 Match History — {summoner_name}#{summoner_tag}",
+        color=0x5865F2,
+    )
+    embed.add_field(name="Recent Games", value="\n".join(lines), inline=False)
     await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="leaderboard", description="Show all tracked players ranked by LP")
 async def leaderboard(interaction: discord.Interaction):
     if not db:
-        await interaction.response.send_message("Bot is still starting up, try again in a moment.")
+        await interaction.response.send_message("Bot is still starting up, try again in a moment.", ephemeral=True)
         return
 
-    all_players = db.get_all_players()
+    all_players = _filter_to_roster(db.get_all_players())
     if not all_players:
-        await interaction.response.send_message("No player data yet.")
+        await interaction.response.send_message("No player data yet.", ephemeral=True)
         return
 
     def sort_key(p):
-        tier = p.get("current_tier", "Unranked").upper()
-        div = p.get("current_rank", "IV") or "IV"
+        tier = (p.get("current_tier") or "Unranked").upper()
+        div = p.get("current_rank") or "IV"
         lp = p.get("current_lp", 0)
         if tier == "UNRANKED":
             return (-1, 0, 0)
         return (rank_value(tier, div), lp)
 
     sorted_players = sorted(all_players, key=sort_key, reverse=True)
-
     embed = discord.Embed(title="🏆 Leaderboard", color=0x5865F2)
-
     medals = ["🥇", "🥈", "🥉"]
+
     for i, p in enumerate(sorted_players):
         name = p.get("summoner_name", "Unknown")
         tag = p.get("tag", "NA1")
-        tier = p.get("current_tier", "Unranked")
-        division = p.get("current_rank", "")
-        lp = p.get("current_lp", 0)
-        win_streak = p.get("win_streak", 0)
-        loss_streak = p.get("loss_streak", 0)
+        rank_str, streak_str = format_rank_line(
+            p.get("current_tier", "Unranked"),
+            p.get("current_rank", ""),
+            p.get("current_lp", 0),
+            p.get("win_streak", 0),
+            p.get("loss_streak", 0),
+        )
+        prefix = medals[i] if i < 3 else f"`{i + 1}.`"
 
-        tier_upper = tier.upper() if tier else "UNRANKED"
-        tier_emoji = DiscordHandler.RANK_EMOJIS.get(tier_upper, "❓")
-        prefix = medals[i] if i < 3 else f"`{i+1}.`"
-
-        if tier_upper in ("MASTER", "GRANDMASTER", "CHALLENGER"):
-            rank_str = f"{tier_emoji} {tier.title()} — {lp} LP"
-        elif tier_upper == "UNRANKED":
-            rank_str = "Unranked"
-        else:
-            rank_str = f"{tier_emoji} {tier.title()} {division} — {lp} LP"
-
-        streak_str = ""
-        if win_streak > 1:
-            streak_str = f" 🔥{win_streak}W"
-        elif loss_streak > 1:
-            streak_str = f" 💀{loss_streak}L"
+        weekly = db.get_weekly_player_stats(p["puuid"])
+        weekly_str = ""
+        if weekly["total"] > 0:
+            wr = weekly["wins"] / weekly["total"] * 100
+            lp_sign = "+" if weekly["net_lp"] >= 0 else ""
+            weekly_str = f" · {wr:.0f}% WR · {lp_sign}{weekly['net_lp']} LP this week"
 
         embed.add_field(
             name=f"{prefix} {name}#{tag}",
-            value=f"{rank_str}{streak_str}",
-            inline=False
+            value=f"{rank_str}{streak_str}{weekly_str}",
+            inline=False,
         )
 
     await interaction.response.send_message(embed=embed)
@@ -835,110 +885,107 @@ async def leaderboard(interaction: discord.Interaction):
     name="Summoner name",
     tag="Tag (e.g. NA1)",
     member="Discord member to link (ping them)",
-    discord_id="Or provide Discord user ID directly"
+    discord_id="Or provide Discord user ID directly",
 )
 async def add_player(interaction: discord.Interaction, name: str, tag: str,
                      member: discord.Member = None, discord_id: str = None):
-    # Resolve discord ID from member mention or raw ID string
+    if not riot or not db:
+        await interaction.response.send_message("Bot is still starting up, try again in a moment.", ephemeral=True)
+        return
+
     resolved_id = None
     if member:
-        resolved_id = member.id
+        resolved_id = str(member.id)
     elif discord_id:
         try:
-            resolved_id = int(discord_id)
+            resolved_id = str(int(discord_id))
         except ValueError:
-            await interaction.response.send_message("Invalid discord_id — must be a numeric user ID.")
+            await interaction.response.send_message("Invalid discord_id — must be a numeric user ID.", ephemeral=True)
             return
 
-    with open("config.json", "r") as f:
-        config = json.load(f)
+    await interaction.response.defer(ephemeral=True)
 
-    players_cfg = config.get("players", [])
+    # Validate against Riot API and get canonical casing
+    summoner = await asyncio.to_thread(riot.get_summoner_by_name, name, tag)
+    if not summoner:
+        await interaction.followup.send(
+            f"**{name}#{tag}** not found on Riot. Check the spelling and tag.", ephemeral=True
+        )
+        return
 
-    for p in players_cfg:
-        if p.get("summoner_name", "").lower() == name.lower() and p.get("tag", "").lower() == tag.lower():
-            await interaction.response.send_message(f"**{name}#{tag}** is already being tracked.")
-            return
+    canonical_name = summoner.get("gameName", name)
+    canonical_tag = summoner.get("tagLine", tag)
 
-    new_player = {"summoner_name": name, "tag": tag}
-    if resolved_id:
-        new_player["discord_id"] = resolved_id
+    added = db.add_roster_entry(canonical_name, canonical_tag, resolved_id)
 
-    players_cfg.append(new_player)
-    config["players"] = players_cfg
-
-    with open("config.json", "w") as f:
-        json.dump(config, f, indent=2)
+    if not added:
+        # add_roster_entry returns False only if the entry was already active
+        # (it reactivates inactive entries and returns True for those)
+        await interaction.followup.send(
+            f"**{canonical_name}#{canonical_tag}** is already being tracked.", ephemeral=True
+        )
+        return
 
     embed = discord.Embed(
         title="✅ Player Added",
-        description=f"**{name}#{tag}** will be tracked starting next poll.",
-        color=0x00FF00
+        description=f"**{canonical_name}#{canonical_tag}** will be tracked starting next poll.",
+        color=0x00FF00,
     )
     if resolved_id:
         embed.add_field(name="Discord User", value=f"<@{resolved_id}>", inline=True)
-
-    await interaction.response.send_message(embed=embed)
-    logger.info(f"Added player {name}#{tag} via /add command")
+    # Success is announced publicly; only errors are ephemeral
+    await interaction.channel.send(embed=embed)
+    await interaction.followup.send(f"Added **{canonical_name}#{canonical_tag}**.", ephemeral=True)
+    logger.info(f"Added player {canonical_name}#{canonical_tag} via /add")
 
 
 @bot.tree.command(name="remove", description="Remove a player from the tracker")
 @app_commands.describe(
     name="Summoner name (or leave blank if using @member)",
     tag="Tag (e.g. NA1)",
-    member="Or remove by pinging the Discord member"
+    member="Or remove by pinging the Discord member",
 )
 async def remove_player(interaction: discord.Interaction, name: str = None, tag: str = None,
                         member: discord.Member = None):
-    if not name and not member:
-        await interaction.response.send_message("Provide a summoner `name`/`tag` or a @member to remove.")
+    if not db:
+        await interaction.response.send_message("Bot is still starting up, try again in a moment.", ephemeral=True)
         return
 
-    with open("config.json", "r") as f:
-        config = json.load(f)
-
-    players_cfg = config.get("players", [])
-    original_count = len(players_cfg)
+    if not name and not member:
+        await interaction.response.send_message(
+            "Provide a summoner `name`/`tag` or a @member to remove.", ephemeral=True
+        )
+        return
 
     if member:
-        players_cfg = [
-            p for p in players_cfg
-            if str(p.get("discord_id", "")) != str(member.id)
-        ]
+        affected = db.deactivate_roster_entry(discord_id=str(member.id))
         identifier = member.mention
     else:
         if not tag:
-            await interaction.response.send_message("Provide both `name` and `tag` to remove by summoner name.")
+            await interaction.response.send_message(
+                "Provide both `name` and `tag` to remove by summoner name.", ephemeral=True
+            )
             return
-        players_cfg = [
-            p for p in players_cfg
-            if not (p.get("summoner_name", "").lower() == name.lower()
-                    and p.get("tag", "").lower() == tag.lower())
-        ]
+        affected = db.deactivate_roster_entry(name=name, tag=tag)
         identifier = f"**{name}#{tag}**"
 
-    if len(players_cfg) == original_count:
-        await interaction.response.send_message(f"{identifier} wasn't found in the tracker.")
+    if not affected:
+        await interaction.response.send_message(f"{identifier} wasn't found in the tracker.", ephemeral=True)
         return
-
-    config["players"] = players_cfg
-
-    with open("config.json", "w") as f:
-        json.dump(config, f, indent=2)
 
     embed = discord.Embed(
         title="🗑️ Player Removed",
         description=f"{identifier} has been removed. Match history is preserved in the database.",
-        color=0xFF6347
+        color=0xFF6347,
     )
     await interaction.response.send_message(embed=embed)
-    logger.info(f"Removed player {identifier} via /remove command")
+    logger.info(f"Removed player {identifier} via /remove")
 
 
 @bot.tree.command(name="clash", description="Show upcoming Clash tournaments and sign up")
 async def clash(interaction: discord.Interaction):
     if not db:
-        await interaction.response.send_message("Bot is still starting up, try again in a moment.")
+        await interaction.response.send_message("Bot is still starting up, try again in a moment.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -964,12 +1011,10 @@ async def clash(interaction: discord.Interaction):
         if not active:
             continue
 
-        # Skip if tournament has already started
         earliest_start = min(p["startTime"] for p in active)
         if earliest_start < now_ms:
             continue
 
-        # If already posted, delete the old message and repost with current signups
         existing = db.get_clash_event(tid)
         if existing:
             try:
@@ -978,7 +1023,7 @@ async def clash(interaction: discord.Interaction):
                     old_msg = await old_ch.fetch_message(int(existing["message_id"]))
                     await old_msg.delete()
             except Exception:
-                pass  # Already deleted or inaccessible
+                pass
 
         signups = db.get_clash_signups(tid) if existing else []
         embed = _build_clash_embed(name_raw, schedule, signups)
@@ -990,9 +1035,7 @@ async def clash(interaction: discord.Interaction):
         posted += 1
 
     if posted > 0:
-        await interaction.followup.send(
-            f"Posted {posted} Clash tournament(s) above.", ephemeral=True
-        )
+        await interaction.followup.send(f"Posted {posted} Clash tournament(s) above.", ephemeral=True)
     else:
         await interaction.followup.send("No upcoming Clash tournaments found.", ephemeral=True)
 
@@ -1000,11 +1043,11 @@ async def clash(interaction: discord.Interaction):
 @bot.tree.command(name="graph", description="LP over time chart. Use 'all', a name#tag, or @mention.")
 @app_commands.describe(
     member="Discord member to graph",
-    summoner="name#tag for a specific player, or leave blank / 'all' for everyone"
+    summoner="name#tag for a specific player, or leave blank / 'all' for everyone",
 )
 async def graph(interaction: discord.Interaction, member: discord.Member = None, summoner: str = None):
     if not db:
-        await interaction.response.send_message("Bot is still starting up, try again in a moment.")
+        await interaction.response.send_message("Bot is still starting up, try again in a moment.", ephemeral=True)
         return
 
     try:
@@ -1013,33 +1056,29 @@ async def graph(interaction: discord.Interaction, member: discord.Member = None,
         import matplotlib.pyplot as plt
         import matplotlib.dates as mdates
     except ImportError:
-        await interaction.response.send_message("matplotlib is not installed on this server.")
+        await interaction.response.send_message("matplotlib is not installed on this server.", ephemeral=True)
         return
 
-    await interaction.response.defer()
-
-    all_players = db.get_all_players()
+    all_players = _filter_to_roster(db.get_all_players())
     if not all_players:
-        await interaction.followup.send("No player data yet.")
+        await interaction.response.send_message("No player data yet.", ephemeral=True)
         return
 
     if member:
-        with open("config.json") as f:
-            config = json.load(f)
-        target = next(
-            (p for p in config.get("players", []) if str(p.get("discord_id", "")) == str(member.id)),
-            None
-        )
+        roster = db.get_roster()
+        target = next((r for r in roster if str(r.get("discord_id", "")) == str(member.id)), None)
         if not target:
-            await interaction.followup.send(f"No summoner linked to {member.mention}.")
+            await interaction.response.send_message(f"No summoner linked to {member.mention}.", ephemeral=True)
             return
         targets = [
             p for p in all_players
-            if p.get("summoner_name", "").lower() == target["summoner_name"].lower()
-            and p.get("tag", "").lower() == target.get("tag", "").lower()
+            if p["summoner_name"].lower() == target["summoner_name"].lower()
+            and p["tag"].lower() == target["tag"].lower()
         ]
         if not targets:
-            await interaction.followup.send(f"No data for **{target['summoner_name']}#{target.get('tag', '')}** yet.")
+            await interaction.response.send_message(
+                f"No data for **{target['summoner_name']}#{target['tag']}** yet.", ephemeral=True
+            )
             return
         show_all = False
     else:
@@ -1048,77 +1087,49 @@ async def graph(interaction: discord.Interaction, member: discord.Member = None,
             targets = all_players
         else:
             if "#" not in summoner:
-                await interaction.followup.send("Use `name#tag` format, @mention, or leave blank for all players.")
+                await interaction.response.send_message(
+                    "Use `name#tag` format, @mention, or leave blank for all players.", ephemeral=True
+                )
                 return
             tname, ttag = summoner.split("#", 1)
             targets = [
                 p for p in all_players
-                if p.get("summoner_name", "").lower() == tname.lower()
-                and p.get("tag", "").lower() == ttag.lower()
+                if p["summoner_name"].lower() == tname.lower()
+                and p["tag"].lower() == ttag.lower()
             ]
             if not targets:
-                await interaction.followup.send(f"No data for **{summoner}**.")
+                await interaction.response.send_message(f"No data for **{summoner}**.", ephemeral=True)
                 return
 
-    # --- LP scale helpers ---
-    _TIERS = [
-        "IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM",
-        "EMERALD", "DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER"
-    ]
-    _DIV_OFFSET = {"IV": 0, "III": 100, "II": 200, "I": 300}
-    _POOLED = {"MASTER", "GRANDMASTER", "CHALLENGER"}
-    _ABBREV = {
-        "IRON": "Irn", "BRONZE": "Brz", "SILVER": "Slv", "GOLD": "Gld",
-        "PLATINUM": "Plt", "EMERALD": "Emr", "DIAMOND": "Dia",
-        "MASTER": "Master", "GRANDMASTER": "GM", "CHALLENGER": "Chall",
-    }
+    # All validation passed — defer publicly for the chart render
+    await interaction.response.defer()
+
     TIER_COLORS = {
         "IRON": "#a8a8a8", "BRONZE": "#e08040", "SILVER": "#d0dae8",
         "GOLD": "#ffd700", "PLATINUM": "#00ffcc", "EMERALD": "#00ff66",
         "DIAMOND": "#44aaff", "MASTER": "#cc44ff", "GRANDMASTER": "#ff4444",
         "CHALLENGER": "#ff9933",
     }
-    # Subtle background fill color per tier (flat band)
     TIER_BG_COLORS = {
         "IRON": "#505050", "BRONZE": "#6e3a18", "SILVER": "#4a5560",
         "GOLD": "#6e5a00", "PLATINUM": "#006655", "EMERALD": "#005c2a",
         "DIAMOND": "#003d80", "MASTER": "#440080", "GRANDMASTER": "#800000",
         "CHALLENGER": "#804000",
     }
+
     def _shift_color(hex_color: str, idx: int) -> str:
-        """Vary a tier base color per player index using wide hue steps, keeping lines bright."""
         r, g, b = (int(hex_color.lstrip("#")[i:i+2], 16) / 255 for i in (0, 2, 4))
         h, s, v = colorsys.rgb_to_hsv(r, g, b)
         hue_steps = [0, 0.08, -0.08, 0.16, -0.16, 0.24, -0.24]
         h = (h + hue_steps[idx % len(hue_steps)]) % 1.0
-        s = min(1.0, max(0.7, s))   # keep saturation high
-        v = min(1.0, max(0.8, v))   # keep brightness high
+        s = min(1.0, max(0.7, s))
+        v = min(1.0, max(0.8, v))
         r2, g2, b2 = colorsys.hsv_to_rgb(h, s, v)
         return f"#{int(r2*255):02x}{int(g2*255):02x}{int(b2*255):02x}"
 
-    def to_abs_lp(tier: str, division: str, lp: int) -> int:
-        t = (tier or "IRON").upper()
-        t_idx = _TIERS.index(t) if t in _TIERS else 0
-        if t in _POOLED:
-            return t_idx * 400 + lp
-        return t_idx * 400 + _DIV_OFFSET.get((division or "IV").upper(), 0) + lp
-
-    def abs_to_label(abs_lp: int) -> str:
-        t_idx = abs_lp // 400
-        if t_idx >= len(_TIERS):
-            return ""
-        t = _TIERS[t_idx]
-        abbrev = _ABBREV.get(t, t.title())
-        if t in _POOLED:
-            lp_within = abs_lp % 400
-            return f"{abbrev} {lp_within}LP" if lp_within else abbrev
-        div = ["IV", "III", "II", "I"][(abs_lp % 400) // 100]
-        return f"{abbrev} {div}"
-
-    # --- Collect all absolute LP values and build series ---
     all_abs_vals = []
-    player_series = []  # (xs, ys, label, color)
-    tier_counts = {}  # track how many players per tier so we can vary shades
+    player_series = []
+    tier_counts = {}
 
     for p in targets:
         puuid = p.get("puuid")
@@ -1157,22 +1168,17 @@ async def graph(interaction: discord.Interaction, member: discord.Member = None,
 
     min_abs = min(all_abs_vals)
     max_abs = max(all_abs_vals)
-
-    # Y-axis: start of tier containing the lowest player → start of tier above the highest
     y_min = (min_abs // 400) * 400
     y_max = ((max_abs // 400) + 1) * 400
-
     y_ticks = list(range(y_min, y_max + 1, 100))
     y_labels = [abs_to_label(y) for y in y_ticks]
 
-    # Taller figure when spanning many divisions
     fig_h = max(5.0, len(y_ticks) * 0.42)
     fig, ax = plt.subplots(figsize=(10, fig_h))
     _BG = "#141518"
-    _BG_RGB = (20, 21, 24)  # #141518 as ints
+    _BG_RGB = (20, 21, 24)
 
     def _blend(fg_hex: str, a: float) -> str:
-        """Pre-blend fg_hex onto _BG at alpha a, returning a solid hex colour."""
         fg = [int(fg_hex.lstrip("#")[i:i+2], 16) for i in (0, 2, 4)]
         out = [int(_BG_RGB[i] * (1 - a) + fg[i] * a) for i in range(3)]
         return f"#{out[0]:02x}{out[1]:02x}{out[2]:02x}"
@@ -1185,24 +1191,17 @@ async def graph(interaction: discord.Interaction, member: discord.Member = None,
     ax.yaxis.label.set_color("white")
     ax.title.set_color("white")
 
-    # Tier background bands — solid pre-blended colours (no alpha, avoids compositing)
-    for i, tier in enumerate(_TIERS):
+    for i, tier in enumerate(TIER_ORDER):
         tier_y_lo = i * 400
         tier_y_hi = (i + 1) * 400
         if tier_y_lo >= y_max or tier_y_hi <= y_min:
             continue
         band_color = _blend(TIER_BG_COLORS.get(tier, "#333333"), 0.35)
-        ax.axhspan(
-            max(tier_y_lo, y_min),
-            min(tier_y_hi, y_max),
-            facecolor=band_color,
-            zorder=0,
-        )
+        ax.axhspan(max(tier_y_lo, y_min), min(tier_y_hi, y_max), facecolor=band_color, zorder=0)
 
     for xs, ys, label, color in player_series:
         ax.plot(xs, ys, marker="o", markersize=4, linewidth=2.0, color=color, label=label)
 
-    # Gridlines: heavier at tier boundaries (every 400 LP), faint at divisions (every 100 LP)
     for tick in y_ticks:
         is_tier = (tick % 400 == 0)
         ax.axhline(
@@ -1247,7 +1246,6 @@ async def graph(interaction: discord.Interaction, member: discord.Member = None,
     finally:
         plt.close(fig)
     buf.seek(0)
-
     await interaction.followup.send(file=discord.File(buf, filename="lp_graph.png"))
 
 
@@ -1256,21 +1254,20 @@ async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(
         title="📖 LoL Tracker — Commands",
         description="Tracks your friends' ranked games and posts results in real time.",
-        color=0x5865F2
+        color=0x5865F2,
     )
-
     embed.add_field(
         name="📊 Info",
         value=(
             "`/rank [summoner]` — Current rank & LP for all players (or one)\n"
             "`/stats [@member | summoner]` — Win rate, KDA, fav champ & role, last 10 games\n"
             "`/history [@member | summoner]` — Last 10 match results\n"
-            "`/leaderboard` — All players ranked by LP\n"
-            "`/players` — List every tracked summoner\n"
+            "`/leaderboard` — All players ranked by LP (includes 7-day stats)\n"
+            "`/players` — List every tracked summoner with Discord links\n"
             "`/graph [summoner]` — LP over time chart\n"
             "`/clash` — Post upcoming Clash tournaments · React ✅ to sign up"
         ),
-        inline=False
+        inline=False,
     )
     embed.add_field(
         name="⚙️ Management",
@@ -1278,18 +1275,17 @@ async def help_command(interaction: discord.Interaction):
             "`/add <name> <tag> [@member]` — Add a player to the tracker\n"
             "`/remove <name> <tag>` or `/remove @member` — Remove a player"
         ),
-        inline=False
+        inline=False,
     )
     embed.add_field(
         name="🔧 Misc",
         value="`/ping` — Check bot latency\n`/help` — Show this message",
-        inline=False
+        inline=False,
     )
-    embed.set_footer(text="Bot checks for new games every 60 seconds.")
+    embed.set_footer(text="Bot checks for new games every 60 seconds · Weekly recap posts Sunday afternoon.")
     await interaction.response.send_message(embed=embed)
 
 
-# Run the bot
 if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN")
     if not token:
