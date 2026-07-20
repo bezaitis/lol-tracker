@@ -122,7 +122,18 @@ def _base_match_data(**overrides) -> dict:
         "game_end_ts": None,
         "promoted": False,
         "demoted": False,
+        "rank_changed_ambiguous": False,
+        "new_rank_label": "Gold II",
+        "lp_game_count": None,
+        "vision_score": 30,
         "gold_diff": 1200,
+        "opponent_champion": "Zed",
+        "opponent_name": "TestOpp",
+        "opponent_tag": "NA1",
+        "opponent_kills": 3,
+        "opponent_deaths": 5,
+        "opponent_assists": 2,
+        "opponent_kda": 1.0,
         "pentakills": 0,
         "cs_per_min": 7.2,
         "position": "Mid",
@@ -150,12 +161,13 @@ class TestMatchEmbed:
         assert "Position" in names
         assert "Duration" in names
 
-    def test_field_grid_has_kda_cs_gold(self):
+    def test_field_grid_has_kda_cs_vision(self):
         embed = DiscordHandler.create_match_embed("bez#7979", _base_match_data())
         names = [f.name for f in embed.fields]
         assert "KDA" in names
         assert "CS/min" in names
-        assert "Gold Diff" in names
+        assert "Vision" in names
+        assert "Gold Diff" not in names  # Gold Diff moved into Lane Opponent field
 
     def test_lp_field_shows_change(self):
         embed = DiscordHandler.create_match_embed("bez#7979", _base_match_data(
@@ -223,6 +235,125 @@ class TestMatchEmbed:
         all_text = " ".join(f.value for f in embed.fields)
         assert "Excellent" not in all_text
         assert "Rough" not in all_text
+
+    def test_lp_field_shows_rank_label(self):
+        embed = DiscordHandler.create_match_embed("bez#7979", _base_match_data(
+            new_lp=80, lp_change=20, new_rank_label="Gold II"
+        ))
+        lp_field = next((f for f in embed.fields if f.name == "LP"), None)
+        assert lp_field is not None
+        assert "Gold II" in lp_field.value
+
+    def test_lp_field_batch_note(self):
+        embed = DiscordHandler.create_match_embed("bez#7979", _base_match_data(
+            new_lp=80, lp_change=20, lp_game_count=3
+        ))
+        lp_field = next((f for f in embed.fields if f.name == "LP"), None)
+        assert lp_field is not None
+        assert "over 3 games" in lp_field.value
+
+    def test_promoted_lp_field_with_rank_label(self):
+        embed = DiscordHandler.create_match_embed("bez#7979", _base_match_data(
+            promoted=True, new_lp=15, lp_change=None, new_rank_label="Platinum IV"
+        ))
+        lp_field = next((f for f in embed.fields if f.name == "LP"), None)
+        assert lp_field is not None
+        assert "Promoted" in lp_field.value
+        assert "Platinum IV" in lp_field.value
+
+    def test_rank_changed_ambiguous_lp_field(self):
+        embed = DiscordHandler.create_match_embed("bez#7979", _base_match_data(
+            rank_changed_ambiguous=True, new_lp=15, new_rank_label="Platinum IV",
+            promoted=False, demoted=False, lp_change=None
+        ))
+        lp_field = next((f for f in embed.fields if f.name == "LP"), None)
+        assert lp_field is not None
+        assert "⚠️" in lp_field.value
+        assert "Rank changed" in lp_field.value
+        assert "Platinum IV" in lp_field.value
+
+    def test_lane_opponent_field_present(self):
+        embed = DiscordHandler.create_match_embed("bez#7979", _base_match_data())
+        opp_field = next((f for f in embed.fields if "Lane Opponent" in f.name), None)
+        assert opp_field is not None
+        assert "Zed" in opp_field.value
+        assert "TestOpp" in opp_field.value
+        assert "1,200g" in opp_field.value  # gold diff present
+
+    def test_lane_opponent_field_absent_when_no_opponent(self):
+        embed = DiscordHandler.create_match_embed("bez#7979", _base_match_data(
+            opponent_champion=None
+        ))
+        assert not any("Lane Opponent" in f.name for f in embed.fields)
+
+    def test_vision_field_value(self):
+        embed = DiscordHandler.create_match_embed("bez#7979", _base_match_data(vision_score=42))
+        vision_field = next((f for f in embed.fields if f.name == "Vision"), None)
+        assert vision_field is not None
+        assert vision_field.value == "42"
+
+
+class TestClashResultEmbed:
+    def _make_participants(self, win: bool, same_team: bool = True) -> list:
+        p1 = {
+            "summoner_name": "Bez", "tag": "7979", "discord_id": "111",
+            "champion": "Akali", "kills": 8, "deaths": 2, "assists": 5,
+            "kda": 6.5, "win": win, "vision_score": 25, "team_id": 100,
+        }
+        p2 = {
+            "summoner_name": "Ally", "tag": "NA1", "discord_id": "222",
+            "champion": "Jinx", "kills": 12, "deaths": 3, "assists": 7,
+            "kda": 6.33, "win": win if same_team else not win,
+            "vision_score": 18, "team_id": 100 if same_team else 200,
+        }
+        return [p1, p2]
+
+    def test_win_embed_color(self):
+        embed = DiscordHandler.create_clash_result_embed(
+            self._make_participants(win=True), 1800, None
+        )
+        assert embed.color.value == DiscordHandler.WIN_COLOR
+
+    def test_loss_embed_color(self):
+        embed = DiscordHandler.create_clash_result_embed(
+            self._make_participants(win=False), 1800, None
+        )
+        assert embed.color.value == DiscordHandler.LOSS_COLOR
+
+    def test_split_team_neutral_color(self):
+        embed = DiscordHandler.create_clash_result_embed(
+            self._make_participants(win=True, same_team=False), 1800, None, split_teams=True
+        )
+        assert embed.color.value == 0x5865F2
+
+    def test_one_field_per_player(self):
+        embed = DiscordHandler.create_clash_result_embed(
+            self._make_participants(win=True), 1800, None
+        )
+        player_fields = [f for f in embed.fields]
+        names = [f.name for f in player_fields]
+        assert "Bez#7979" in names
+        assert "Ally#NA1" in names
+
+    def test_field_contains_champion_and_kda(self):
+        embed = DiscordHandler.create_clash_result_embed(
+            self._make_participants(win=True), 1800, None
+        )
+        bez_field = next(f for f in embed.fields if "Bez" in f.name)
+        assert "Akali" in bez_field.value
+        assert "8/2/5" in bez_field.value
+
+    def test_aram_clash_title(self):
+        embed = DiscordHandler.create_clash_result_embed(
+            self._make_participants(win=True), 1800, None, queue_id=720
+        )
+        assert "ARAM" in embed.title
+
+    def test_duration_in_footer(self):
+        embed = DiscordHandler.create_clash_result_embed(
+            self._make_participants(win=True), 1800, None
+        )
+        assert "30:00" in embed.footer.text
 
 
 # ---------------------------------------------------------------------------
@@ -437,3 +568,27 @@ class TestPlayerStats:
             tmp_db.add_match(f"NA1_{i}", "p1", True, "Akali", 5, 1, 3, 20, 80 + i, 1800)
         history = tmp_db.get_match_history("p1", limit=10)
         assert len(history) == 10
+
+
+class TestClashMatchPosting:
+    def test_first_call_returns_true(self, tmp_db):
+        assert tmp_db.mark_clash_match_posted("NA1_clash_1") is True
+
+    def test_second_call_returns_false(self, tmp_db):
+        tmp_db.mark_clash_match_posted("NA1_clash_1")
+        assert tmp_db.mark_clash_match_posted("NA1_clash_1") is False
+
+    def test_different_match_ids_both_claim(self, tmp_db):
+        assert tmp_db.mark_clash_match_posted("NA1_clash_1") is True
+        assert tmp_db.mark_clash_match_posted("NA1_clash_2") is True
+
+    def test_update_last_clash_match_id_roundtrip(self, tmp_db):
+        tmp_db.add_or_update_player("p1", "Bez", "7979")
+        tmp_db.update_last_clash_match_id("p1", "NA1_clash_42")
+        p = tmp_db.get_player("p1")
+        assert p["last_clash_match_id"] == "NA1_clash_42"
+
+    def test_last_clash_match_id_initially_none(self, tmp_db):
+        tmp_db.add_or_update_player("p1", "Bez", "7979")
+        p = tmp_db.get_player("p1")
+        assert p.get("last_clash_match_id") is None

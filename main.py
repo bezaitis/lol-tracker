@@ -217,11 +217,15 @@ async def check_matches():
 
         players = db.get_roster(active_only=True)
 
-        # Build puuid→player map for active roster (used for duo detection)
+        # Build puuid→player map for active roster (used for duo detection and Clash pings)
         all_db_players = {p["puuid"]: p for p in db.get_all_players()}
         roster_set = {(r["summoner_name"].lower(), r["tag"].lower()) for r in players}
+        roster_discord = {
+            (r["summoner_name"].lower(), r["tag"].lower()): r.get("discord_id")
+            for r in players
+        }
         tracked_puuids = {
-            puuid: p
+            puuid: {**p, "discord_id": roster_discord.get((p["summoner_name"].lower(), p["tag"].lower()))}
             for puuid, p in all_db_players.items()
             if (p["summoner_name"].lower(), p["tag"].lower()) in roster_set
         }
@@ -281,6 +285,111 @@ async def weekly_recap():
     logger.info("Posted weekly recap")
 
 
+async def _check_player_clash_matches(puuid: str, summoner_name: str, tag: str,
+                                      discord_id: str, tracked_puuids: dict):
+    """Fetch and post new Clash match results for one player. Deduped across all tracked players."""
+    ONE_DAY = 86400
+
+    player_data = db.get_player(puuid)
+    last_clash_id = player_data.get("last_clash_match_id") if player_data else None
+
+    clash_700 = await asyncio.to_thread(riot.get_recent_matches, puuid, 0, 10, 700) or []
+    clash_720 = await asyncio.to_thread(riot.get_recent_matches, puuid, 0, 10, 720) or []
+
+    seen = set()
+    merged = []
+    for mid in clash_700 + clash_720:
+        if mid not in seen:
+            seen.add(mid)
+            merged.append(mid)
+
+    new_clash_ids = []
+    for mid in merged:
+        if mid == last_clash_id:
+            break
+        new_clash_ids.append(mid)
+
+    if not new_clash_ids:
+        return
+
+    new_clash_ids.reverse()
+
+    for match_id in new_clash_ids:
+        match_data = await asyncio.to_thread(riot.get_match_details, match_id)
+        if not match_data:
+            db.update_last_clash_match_id(puuid, match_id)
+            continue
+
+        player_match = riot.get_player_in_match(match_data, puuid)
+        if not player_match:
+            db.update_last_clash_match_id(puuid, match_id)
+            continue
+
+        info = match_data.get("info", {})
+        game_duration = info.get("gameDuration", 0)
+        game_end_ts_ms = info.get("gameEndTimestamp") or (
+            info.get("gameCreation", 0) + game_duration * 1000
+        )
+        game_end_ts = game_end_ts_ms / 1000
+        queue_id = info.get("queueId", 700)
+
+        if time.time() - game_end_ts > ONE_DAY:
+            db.update_last_clash_match_id(puuid, match_id)
+            logger.info(f"{summoner_name} — skipping old Clash match {match_id}")
+            continue
+
+        if player_match.get("gameEndedInEarlySurrender", False) and game_duration < 180:
+            db.update_last_clash_match_id(puuid, match_id)
+            logger.info(f"{summoner_name} — skipping Clash remake {match_id}")
+            continue
+
+        if not db.mark_clash_match_posted(match_id):
+            db.update_last_clash_match_id(puuid, match_id)
+            continue
+
+        participants = info.get("participants", [])
+        tracked_in_match = []
+        for p in participants:
+            if p["puuid"] in tracked_puuids:
+                tp = tracked_puuids[p["puuid"]]
+                k = p.get("kills", 0)
+                d = p.get("deaths", 0)
+                a = p.get("assists", 0)
+                tracked_in_match.append({
+                    "summoner_name": tp["summoner_name"],
+                    "tag": tp["tag"],
+                    "discord_id": tp.get("discord_id"),
+                    "champion": p.get("championName", "Unknown"),
+                    "kills": k,
+                    "deaths": d,
+                    "assists": a,
+                    "kda": (k + a) / max(d, 1),
+                    "win": p.get("win", False),
+                    "vision_score": p.get("visionScore", 0),
+                    "team_id": p.get("teamId"),
+                })
+
+        if not tracked_in_match:
+            db.update_last_clash_match_id(puuid, match_id)
+            continue
+
+        teams = {p["team_id"] for p in tracked_in_match}
+        split_teams = len(teams) > 1
+
+        embed = DiscordHandler.create_clash_result_embed(
+            tracked_in_match, game_duration, game_end_ts,
+            split_teams=split_teams, queue_id=queue_id,
+        )
+
+        mention_parts = [f"<@{tp['discord_id']}>" for tp in tracked_in_match if tp.get("discord_id")]
+        ping_content = " ".join(mention_parts) if mention_parts else None
+
+        await channel.send(content=ping_content, embed=embed)
+        logger.info(f"Posted Clash result {match_id} (claimed by {summoner_name})")
+
+        db.update_last_clash_match_id(puuid, match_id)
+
+
 async def check_player_matches(summoner_name: str, tag: str = "NA1",
                                 player_config: dict = None,
                                 tracked_puuids: dict = None):
@@ -323,6 +432,14 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1",
             lp = solo_queue.get("leaguePoints", 0)
             db.update_player_rank(puuid, tier, rank, lp)
 
+            tier_upper = tier.upper()
+            if tier_upper in _POOLED_TIERS:
+                new_rank_label = tier.title()
+            elif tier_upper == "UNRANKED":
+                new_rank_label = ""
+            else:
+                new_rank_label = f"{tier.title()} {rank}".strip()
+
             if old_tier and old_tier != "Unranked" and (old_tier != tier or (old_rank and old_rank != rank)):
                 old_val = rank_value(old_tier, old_rank or "I")
                 new_val = rank_value(tier, rank or "I")
@@ -348,11 +465,19 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1",
             tier = old_tier or "Unranked"
             rank = old_rank or ""
             lp = old_lp
+            tier_upper = tier.upper()
+            if tier_upper in _POOLED_TIERS:
+                new_rank_label = tier.title()
+            elif tier_upper == "UNRANKED":
+                new_rank_label = ""
+            else:
+                new_rank_label = f"{tier.title()} {rank}".strip()
             logger.debug(f"No solo queue data for {summoner_name}")
 
         recent_matches = await asyncio.to_thread(riot.get_recent_matches, puuid, 0, 10)
         if not recent_matches:
             logger.debug(f"No recent matches for {summoner_name}")
+            await _check_player_clash_matches(puuid, summoner_name, tag, discord_id, tracked_puuids or {})
             return
 
         last_seen_id = player_data.get("last_match_id") if player_data else None
@@ -365,10 +490,12 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1",
 
         if not new_match_ids:
             logger.debug(f"{summoner_name} - no new matches")
+            await _check_player_clash_matches(puuid, summoner_name, tag, discord_id, tracked_puuids or {})
             return
 
         # Process oldest-first so streaks accumulate in the right order
         new_match_ids.reverse()
+        batch_size = len(new_match_ids)
 
         ONE_DAY = 86400
 
@@ -413,6 +540,7 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1",
             kills = player_match.get("kills", 0)
             deaths = player_match.get("deaths", 0)
             assists = player_match.get("assists", 0)
+            vision_score = player_match.get("visionScore", 0)
 
             # Remakes: early surrender before 3 min
             if player_match.get("gameEndedInEarlySurrender", False) and game_duration < 180:
@@ -443,6 +571,11 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1",
                 lp_change = None
 
             gold_diff = None
+            opponent_champion = None
+            opponent_name = None
+            opponent_tag = None
+            opponent_kills = opponent_deaths = opponent_assists = 0
+            opponent_kda = 0.0
             player_position = player_match.get("teamPosition", "")
             player_gold = player_match.get("goldEarned", 0)
             player_team_id = player_match.get("teamId")
@@ -451,6 +584,17 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1",
                     if (participant.get("teamPosition") == player_position
                             and participant.get("teamId") != player_team_id):
                         gold_diff = player_gold - participant.get("goldEarned", 0)
+                        opponent_champion = participant.get("championName", "Unknown")
+                        opponent_name = (
+                            participant.get("riotIdGameName")
+                            or participant.get("summonerName")
+                            or "Unknown"
+                        )
+                        opponent_tag = participant.get("riotIdTagline", "")
+                        opponent_kills = participant.get("kills", 0)
+                        opponent_deaths = participant.get("deaths", 0)
+                        opponent_assists = participant.get("assists", 0)
+                        opponent_kda = (opponent_kills + opponent_assists) / max(opponent_deaths, 1)
                         break
 
             total_cs = player_match.get("totalMinionsKilled", 0) + player_match.get("neutralMinionsKilled", 0)
@@ -509,9 +653,20 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1",
                 "game_end_ts": game_end_ts,
                 "win_streak": win_streak,
                 "loss_streak": loss_streak,
-                "promoted": is_latest and rank_promoted,
-                "demoted": is_latest and rank_demoted,
+                "promoted": is_latest and rank_promoted and batch_size == 1,
+                "demoted": is_latest and rank_demoted and batch_size == 1,
+                "rank_changed_ambiguous": is_latest and (rank_promoted or rank_demoted) and batch_size > 1,
+                "new_rank_label": new_rank_label if is_latest else "",
+                "lp_game_count": batch_size if is_latest else None,
+                "vision_score": vision_score,
                 "gold_diff": gold_diff,
+                "opponent_champion": opponent_champion,
+                "opponent_name": opponent_name,
+                "opponent_tag": opponent_tag,
+                "opponent_kills": opponent_kills,
+                "opponent_deaths": opponent_deaths,
+                "opponent_assists": opponent_assists,
+                "opponent_kda": opponent_kda,
                 "pentakills": pentakills,
                 "cs_per_min": cs_per_min,
                 "position": position,
@@ -532,6 +687,8 @@ async def check_player_matches(summoner_name: str, tag: str = "NA1",
 
             await channel.send(content=ping_content, embed=embed)
             logger.info(f"Posted match {match_id} for {summoner_name}: {'WIN' if win else 'LOSS'}")
+
+        await _check_player_clash_matches(puuid, summoner_name, tag, discord_id, tracked_puuids or {})
 
     except Exception as e:
         logger.error(f"Exception in check_player_matches for {summoner_name}: {e}", exc_info=True)
