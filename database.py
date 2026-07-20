@@ -101,6 +101,13 @@ class Database:
                 )
             """)
 
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS clash_match_results (
+                    match_id TEXT PRIMARY KEY,
+                    posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
             # Roster table — source of truth for who to track (replaces config.json players list)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS roster (
@@ -118,6 +125,13 @@ class Database:
             # Migration: add position column if missing
             try:
                 cursor.execute("ALTER TABLE matches ADD COLUMN position TEXT DEFAULT NULL")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
+
+            # Migration: add last_clash_match_id column if missing
+            try:
+                cursor.execute("ALTER TABLE players ADD COLUMN last_clash_match_id TEXT DEFAULT NULL")
                 conn.commit()
             except sqlite3.OperationalError:
                 pass
@@ -581,6 +595,26 @@ class Database:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM clash_events WHERE start_time > ?", (now_ms,))
             return [dict(r) for r in cursor.fetchall()]
+
+    def update_last_clash_match_id(self, puuid: str, match_id: str):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE players SET last_clash_match_id = ? WHERE puuid = ?",
+                (match_id, puuid),
+            )
+            conn.commit()
+
+    def mark_clash_match_posted(self, match_id: str) -> bool:
+        """Claim a Clash match for posting. Returns True only for the first caller."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR IGNORE INTO clash_match_results (match_id) VALUES (?)",
+                (match_id,),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
 
     def mark_clash_reminded(self, tournament_id: str):
         with sqlite3.connect(self.db_path) as conn:
