@@ -59,6 +59,20 @@ def abs_to_label(abs_lp: int) -> str:
     div = ["IV", "III", "II", "I"][(abs_lp % 400) // 100]
     return f"{abbrev} {div}"
 
+# Per-player line colors for /graph's multi-player chart (module-level for testability)
+PLAYER_PALETTE = [
+    "#5DA5FF", "#FF6B6B", "#4ECDC4", "#FFD166",
+    "#C77DFF", "#FF9F5B", "#6BCB77", "#FF6FA5",
+    "#00D2D3", "#B0A8B9", "#F4A259", "#8CFF98",
+]
+_GOLDEN_RATIO_CONJUGATE = 0.6180339887
+
+def _overflow_color(i: int) -> str:
+    """Golden-angle hue stepping once the roster exceeds PLAYER_PALETTE — never repeats a color."""
+    hue = (i * _GOLDEN_RATIO_CONJUGATE) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.65, 0.95)
+    return f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
+
 # Logging
 logging.basicConfig(
     level=logging.INFO,
@@ -748,6 +762,43 @@ def _filter_to_roster(all_players: list) -> list:
     return [p for p in all_players if (p["summoner_name"].lower(), p["tag"].lower()) in active]
 
 
+def _resolve_target(all_players: list, member: discord.Member = None, summoner: str = None) -> tuple:
+    """Resolve @member or 'name#tag' to a filtered player list.
+
+    Returns (filtered_list, None) on success, or (None, error_message) on failure.
+    Neither arg given -> (all_players, None) unchanged. Caller sends the error
+    message (ephemeral) itself.
+    """
+    if member:
+        roster = db.get_roster()
+        target = next((r for r in roster if str(r.get("discord_id", "")) == str(member.id)), None)
+        if not target:
+            return None, f"No summoner linked to {member.mention}. Use `/add` to link them."
+        filtered = [
+            p for p in all_players
+            if p["summoner_name"].lower() == target["summoner_name"].lower()
+            and p["tag"].lower() == target["tag"].lower()
+        ]
+        if not filtered:
+            return None, f"No tracked data for **{target['summoner_name']}#{target['tag']}** yet."
+        return filtered, None
+
+    if summoner:
+        if "#" not in summoner:
+            return None, "Use the format `name#tag` (e.g. `bez#7979`)."
+        target_name, target_tag = summoner.split("#", 1)
+        filtered = [
+            p for p in all_players
+            if p["summoner_name"].lower() == target_name.lower()
+            and p["tag"].lower() == target_tag.lower()
+        ]
+        if not filtered:
+            return None, f"No data for **{summoner}**."
+        return filtered, None
+
+    return all_players, None
+
+
 # ---------------------------------------------------------------------------
 # Slash commands
 # ---------------------------------------------------------------------------
@@ -779,52 +830,6 @@ async def players(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="rank", description="Show current rank. Leave blank for all players.")
-@app_commands.describe(summoner="Player name#tag (e.g. bez#7979)")
-async def rank(interaction: discord.Interaction, summoner: str = None):
-    if not db:
-        await interaction.response.send_message("Bot is still starting up, try again in a moment.", ephemeral=True)
-        return
-
-    all_players = _filter_to_roster(db.get_all_players())
-    if not all_players:
-        await interaction.response.send_message("No player data yet — the bot may still be initializing.", ephemeral=True)
-        return
-
-    if summoner:
-        if "#" not in summoner:
-            await interaction.response.send_message("Use the format `name#tag` (e.g. `bez#7979`).", ephemeral=True)
-            return
-        target_name, target_tag = summoner.split("#", 1)
-        all_players = [
-            p for p in all_players
-            if p["summoner_name"].lower() == target_name.lower()
-            and p["tag"].lower() == target_tag.lower()
-        ]
-        if not all_players:
-            await interaction.response.send_message(f"No data for **{summoner}**.", ephemeral=True)
-            return
-
-    embed = discord.Embed(title="📊 Current Ranks", color=0x5865F2)
-    for p in all_players:
-        name = p.get("summoner_name", "Unknown")
-        tag = p.get("tag", "NA1")
-        rank_str, streak_str = format_rank_line(
-            p.get("current_tier", "Unranked"),
-            p.get("current_rank", ""),
-            p.get("current_lp", 0),
-            p.get("win_streak", 0),
-            p.get("loss_streak", 0),
-        )
-        opgg_url = f"https://op.gg/lol/summoners/na/{name}-{tag}"
-        embed.add_field(
-            name=f"{name}#{tag}",
-            value=f"[{rank_str}{streak_str}]({opgg_url})",
-            inline=False,
-        )
-    await interaction.response.send_message(embed=embed)
-
-
 @bot.tree.command(name="stats", description="Show win rate and KDA. Leave blank for all players.")
 @app_commands.describe(
     member="Discord member (ping them)",
@@ -840,37 +845,10 @@ async def stats(interaction: discord.Interaction, member: discord.Member = None,
         await interaction.response.send_message("No player data yet — the bot may still be initializing.", ephemeral=True)
         return
 
-    if member:
-        roster = db.get_roster()
-        target = next((r for r in roster if str(r.get("discord_id", "")) == str(member.id)), None)
-        if not target:
-            await interaction.response.send_message(
-                f"No summoner linked to {member.mention}. Use `/add` to link them.", ephemeral=True
-            )
-            return
-        all_players = [
-            p for p in all_players
-            if p["summoner_name"].lower() == target["summoner_name"].lower()
-            and p["tag"].lower() == target["tag"].lower()
-        ]
-        if not all_players:
-            await interaction.response.send_message(
-                f"No tracked data for **{target['summoner_name']}#{target['tag']}** yet.", ephemeral=True
-            )
-            return
-    elif summoner:
-        if "#" not in summoner:
-            await interaction.response.send_message("Use the format `name#tag` (e.g. `bez#7979`).", ephemeral=True)
-            return
-        target_name, target_tag = summoner.split("#", 1)
-        all_players = [
-            p for p in all_players
-            if p["summoner_name"].lower() == target_name.lower()
-            and p["tag"].lower() == target_tag.lower()
-        ]
-        if not all_players:
-            await interaction.response.send_message(f"No data for **{summoner}**.", ephemeral=True)
-            return
+    all_players, err = _resolve_target(all_players, member, summoner)
+    if err:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
 
     # All validation passed — defer publicly for the aggregate queries
     await interaction.response.defer()
@@ -920,39 +898,19 @@ async def history(interaction: discord.Interaction, member: discord.Member = Non
         await interaction.response.send_message("Bot is still starting up, try again in a moment.", ephemeral=True)
         return
 
-    summoner_name = summoner_tag = None
-
-    if member:
-        roster = db.get_roster()
-        for r in roster:
-            if str(r.get("discord_id", "")) == str(member.id):
-                summoner_name = r["summoner_name"]
-                summoner_tag = r["tag"]
-                break
-        if not summoner_name:
-            await interaction.response.send_message(
-                f"No summoner linked to {member.mention}. Use `/add` to link them.", ephemeral=True
-            )
-            return
-    elif summoner:
-        if "#" not in summoner:
-            await interaction.response.send_message("Use the format `name#tag` (e.g. `bez#7979`).", ephemeral=True)
-            return
-        summoner_name, summoner_tag = summoner.split("#", 1)
-    else:
+    if not member and not summoner:
         await interaction.response.send_message("Provide a @member or a name#tag.", ephemeral=True)
         return
 
     all_players = _filter_to_roster(db.get_all_players())
-    player = next(
-        (p for p in all_players
-         if p["summoner_name"].lower() == summoner_name.lower()
-         and p["tag"].lower() == summoner_tag.lower()),
-        None,
-    )
-    if not player:
-        await interaction.response.send_message(f"No data for **{summoner_name}#{summoner_tag}**.", ephemeral=True)
+    target_players, err = _resolve_target(all_players, member, summoner)
+    if err:
+        await interaction.response.send_message(err, ephemeral=True)
         return
+
+    player = target_players[0]
+    summoner_name = player["summoner_name"]
+    summoner_tag = player["tag"]
 
     matches = db.get_match_history(player["puuid"], limit=10)
     if not matches:
@@ -986,8 +944,12 @@ async def history(interaction: discord.Interaction, member: discord.Member = Non
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="leaderboard", description="Show all tracked players ranked by LP")
-async def leaderboard(interaction: discord.Interaction):
+@bot.tree.command(name="leaderboard", description="Show all tracked players ranked by LP, or one player's rank")
+@app_commands.describe(
+    member="Discord member (ping them)",
+    summoner="Or provide name#tag directly",
+)
+async def leaderboard(interaction: discord.Interaction, member: discord.Member = None, summoner: str = None):
     if not db:
         await interaction.response.send_message("Bot is still starting up, try again in a moment.", ephemeral=True)
         return
@@ -995,6 +957,39 @@ async def leaderboard(interaction: discord.Interaction):
     all_players = _filter_to_roster(db.get_all_players())
     if not all_players:
         await interaction.response.send_message("No player data yet.", ephemeral=True)
+        return
+
+    target_players, err = _resolve_target(all_players, member, summoner)
+    if err:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+
+    if member or summoner:
+        p = target_players[0]
+        name = p.get("summoner_name", "Unknown")
+        tag = p.get("tag", "NA1")
+        rank_str, streak_str = format_rank_line(
+            p.get("current_tier", "Unranked"),
+            p.get("current_rank", ""),
+            p.get("current_lp", 0),
+            p.get("win_streak", 0),
+            p.get("loss_streak", 0),
+        )
+        opgg_url = f"https://op.gg/lol/summoners/na/{name}-{tag}"
+
+        weekly = db.get_weekly_player_stats(p["puuid"])
+        weekly_str = ""
+        if weekly["total"] > 0:
+            wr = weekly["wins"] / weekly["total"] * 100
+            lp_sign = "+" if weekly["net_lp"] >= 0 else ""
+            weekly_str = f" · {wr:.0f}% WR · {lp_sign}{weekly['net_lp']} LP this week"
+
+        embed = discord.Embed(
+            title=f"📊 Rank — {name}#{tag}",
+            description=f"[{rank_str}{streak_str}]({opgg_url}){weekly_str}",
+            color=0x5865F2,
+        )
+        await interaction.response.send_message(embed=embed)
         return
 
     def sort_key(p):
@@ -1222,20 +1217,9 @@ async def graph(interaction: discord.Interaction, member: discord.Member = None,
         return
 
     if member:
-        roster = db.get_roster()
-        target = next((r for r in roster if str(r.get("discord_id", "")) == str(member.id)), None)
-        if not target:
-            await interaction.response.send_message(f"No summoner linked to {member.mention}.", ephemeral=True)
-            return
-        targets = [
-            p for p in all_players
-            if p["summoner_name"].lower() == target["summoner_name"].lower()
-            and p["tag"].lower() == target["tag"].lower()
-        ]
-        if not targets:
-            await interaction.response.send_message(
-                f"No data for **{target['summoner_name']}#{target['tag']}** yet.", ephemeral=True
-            )
+        targets, err = _resolve_target(all_players, member, None)
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
             return
         show_all = False
     else:
@@ -1248,14 +1232,9 @@ async def graph(interaction: discord.Interaction, member: discord.Member = None,
                     "Use `name#tag` format, @mention, or leave blank for all players.", ephemeral=True
                 )
                 return
-            tname, ttag = summoner.split("#", 1)
-            targets = [
-                p for p in all_players
-                if p["summoner_name"].lower() == tname.lower()
-                and p["tag"].lower() == ttag.lower()
-            ]
-            if not targets:
-                await interaction.response.send_message(f"No data for **{summoner}**.", ephemeral=True)
+            targets, err = _resolve_target(all_players, None, summoner)
+            if err:
+                await interaction.response.send_message(err, ephemeral=True)
                 return
 
     # All validation passed — defer publicly for the chart render
@@ -1274,21 +1253,17 @@ async def graph(interaction: discord.Interaction, member: discord.Member = None,
         "CHALLENGER": "#804000",
     }
 
-    def _shift_color(hex_color: str, idx: int) -> str:
-        r, g, b = (int(hex_color.lstrip("#")[i:i+2], 16) / 255 for i in (0, 2, 4))
-        h, s, v = colorsys.rgb_to_hsv(r, g, b)
-        hue_steps = [0, 0.08, -0.08, 0.16, -0.16, 0.24, -0.24]
-        h = (h + hue_steps[idx % len(hue_steps)]) % 1.0
-        s = min(1.0, max(0.7, s))
-        v = min(1.0, max(0.8, v))
-        r2, g2, b2 = colorsys.hsv_to_rgb(h, s, v)
-        return f"#{int(r2*255):02x}{int(g2*255):02x}{int(b2*255):02x}"
+    # Sort deterministically so a player's color is stable across calls regardless
+    # of DB row order or tier changes.
+    sorted_targets = (
+        sorted(targets, key=lambda p: (p.get("summoner_name", "").lower(), p.get("tag", "").lower()))
+        if show_all else targets
+    )
 
     all_abs_vals = []
     player_series = []
-    tier_counts = {}
 
-    for p in targets:
+    for i, p in enumerate(sorted_targets):
         puuid = p.get("puuid")
         pname = p.get("summoner_name", "?")
         ptag = p.get("tag", "NA1")
@@ -1308,14 +1283,11 @@ async def graph(interaction: discord.Interaction, member: discord.Member = None,
             all_abs_vals.append(abs_val)
 
         if xs:
-            last_tier = (snapshots[-1].get("tier") or "IRON").upper()
-            base_color = TIER_COLORS.get(last_tier, "#ffffff")
             if show_all:
-                tier_idx = tier_counts.get(last_tier, 0)
-                color = _shift_color(base_color, tier_idx)
-                tier_counts[last_tier] = tier_idx + 1
+                color = PLAYER_PALETTE[i] if i < len(PLAYER_PALETTE) else _overflow_color(i)
             else:
-                color = base_color
+                last_tier = (snapshots[-1].get("tier") or "IRON").upper()
+                color = TIER_COLORS.get(last_tier, "#ffffff")
             label = f"{pname}#{ptag}" if show_all else pname
             player_series.append((xs, ys, label, color))
 
@@ -1416,10 +1388,9 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="📊 Info",
         value=(
-            "`/rank [summoner]` — Current rank & LP for all players (or one)\n"
             "`/stats [@member | summoner]` — Win rate, KDA, fav champ & role, last 10 games\n"
             "`/history [@member | summoner]` — Last 10 match results\n"
-            "`/leaderboard` — All players ranked by LP (includes 7-day stats)\n"
+            "`/leaderboard [@member | summoner]` — All players ranked by LP, or just one player's rank/weekly stats\n"
             "`/players` — List every tracked summoner with Discord links\n"
             "`/graph [summoner]` — LP over time chart\n"
             "`/clash` — Post upcoming Clash tournaments · React ✅ to sign up"
